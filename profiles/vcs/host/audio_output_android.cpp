@@ -39,12 +39,27 @@ constexpr std::size_t kGuestChannels = 9u;
 constexpr std::uint64_t kChannelDiscontinuityFrames = 64u;
 // Frames moved from the mix ring to the FIFO at a time.
 constexpr std::size_t kSealChunkFrames = 256u;
-// ~370 ms of device-side buffering. Power of two so the indices can wrap freely.
+// ~370 ms of device-side capacity. Power of two so the indices can wrap freely.
 constexpr std::size_t kFifoFrames = 16384u;
-// Start (and restart after an underrun) only with ~46 ms queued. Playing each
+// Start (and restart after an underrun) only with ~93 ms queued. Playing each
 // sealed chunk the moment it arrives turns a slow frame into a train of clicks;
 // one clean gap and a fresh reserve sounds far better.
-constexpr std::uint64_t kPrebufferFrames = 2048u;
+constexpr std::uint64_t kPrebufferFrames = 4096u;
+// The callback keeps the queue between these (~93-186 ms) by playing up to 1%
+// slower or faster -- 17 cents, below what the ear picks out. Without it every
+// underrun left the queue that much fuller for good: it crept up to the full
+// 370 ms (voices trailing the lips), then overflowed and dropped audio.
+constexpr std::uint64_t kQueueLowFrames = 4096u;
+constexpr std::uint64_t kQueueHighFrames = 8192u;
+constexpr double kRateAdjust = 0.01;
+// Gain ramp when the queue runs dry or refills: ~6 ms instead of a hard cut.
+constexpr float kFadeStep = 1.0f / 256.0f;
+// A stream that falls behind the clock (the frame limiter jumped it forward)
+// is waited for, within this much, before its part of the mix is sealed. Kept
+// just above the guest's own catch-up window in vcs_profile.cpp.
+constexpr std::uint64_t kCatchUpHoldFrames = kSampleRate * 3u / 10u;
+// Below this much queued, nothing is waited for: a gap beats running dry.
+constexpr std::uint64_t kEmergencyFrames = 1024u;
 
 struct ChannelStream {
     StreamingLinearResampler resampler;
@@ -52,6 +67,9 @@ struct ChannelStream {
     std::uint32_t source_rate{kSampleRate};
     bool stereo{true};
     bool active{};
+    // Its last buffer still ended before the clock: the guest is refilling it
+    // back to back after a clock jump. A stream that merely stopped is not.
+    bool lagging{};
 };
 
 struct AudioState {
@@ -60,6 +78,7 @@ struct AudioState {
     AAudioStream *stream{};
     std::vector<std::int32_t> ring;
     std::uint64_t output_frame{};   // first mix-ring frame not yet sealed into the FIFO
+    std::uint64_t clock_frame{};    // the guest clock at the last vblank, in mix frames
     std::uint64_t guest_anchor_us{};
     bool timeline_anchored{};
     std::array<ChannelStream, kGuestChannels> channels{};
@@ -74,6 +93,10 @@ struct AudioState {
     std::atomic<std::uint64_t> fifo_write{};
     std::atomic<std::uint64_t> fifo_read{};
     std::atomic<bool> primed{};
+    // Owned by the callback alone.
+    double read_phase{};   // fractional position past fifo_read
+    float gain{};          // fade in/out, 0..1
+    std::int16_t hold_left{}, hold_right{};
     std::atomic<bool> disconnected{};
     std::atomic<std::uint64_t> underruns{};
     std::chrono::steady_clock::time_point last_diagnostic_time{};
@@ -94,28 +117,58 @@ aaudio_data_callback_result_t data_callback(AAudioStream *, void *user, void *au
     const std::uint64_t read = state.fifo_read.load(std::memory_order_relaxed);
     const std::uint64_t available = state.fifo_write.load(std::memory_order_acquire) - read;
 
+    // Silence that fades from the last sample played, so stopping never clicks.
+    const auto fade_out = [&](std::size_t from) {
+        for (std::size_t frame = from; frame < wanted; ++frame) {
+            state.gain = std::max(0.0f, state.gain - kFadeStep);
+            out[frame * kOutputChannels] = static_cast<std::int16_t>(state.hold_left * state.gain);
+            out[frame * kOutputChannels + 1u] = static_cast<std::int16_t>(state.hold_right * state.gain);
+        }
+    };
+
     if (!state.primed.load(std::memory_order_relaxed)) {
         if (available < kPrebufferFrames) {
-            std::memset(out, 0, wanted * kOutputChannels * sizeof(std::int16_t));
+            fade_out(0u);
             return AAUDIO_CALLBACK_RESULT_CONTINUE;
         }
         state.primed.store(true, std::memory_order_relaxed);
+        state.read_phase = 0.0;
     }
 
-    const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(available, wanted));
-    for (std::size_t frame = 0u; frame < count; ++frame) {
-        const std::size_t slot = static_cast<std::size_t>((read + frame) % kFifoFrames) * kOutputChannels;
-        out[frame * kOutputChannels] = state.fifo[slot];
-        out[frame * kOutputChannels + 1u] = state.fifo[slot + 1u];
+    double rate = 1.0;
+    if (available > kQueueHighFrames) rate = 1.0 + kRateAdjust;
+    else if (available < kQueueLowFrames) rate = 1.0 - kRateAdjust;
+
+    // Linear interpolation between neighbouring frames at a fractional step.
+    double position = state.read_phase;
+    std::size_t frame = 0u;
+    for (; frame < wanted; ++frame) {
+        const auto index = static_cast<std::uint64_t>(position);
+        if (index + 1u >= available) break;
+        const float t = static_cast<float>(position - static_cast<double>(index));
+        const std::size_t a = static_cast<std::size_t>((read + index) % kFifoFrames) * kOutputChannels;
+        const std::size_t b = static_cast<std::size_t>((read + index + 1u) % kFifoFrames) * kOutputChannels;
+        const float left = state.fifo[a] + (state.fifo[b] - state.fifo[a]) * t;
+        const float right = state.fifo[a + 1u] + (state.fifo[b + 1u] - state.fifo[a + 1u]) * t;
+        state.gain = std::min(1.0f, state.gain + kFadeStep);
+        state.hold_left = static_cast<std::int16_t>(left);
+        state.hold_right = static_cast<std::int16_t>(right);
+        out[frame * kOutputChannels] = static_cast<std::int16_t>(left * state.gain);
+        out[frame * kOutputChannels + 1u] = static_cast<std::int16_t>(right * state.gain);
+        position += rate;
     }
-    if (count < wanted) {
-        std::memset(out + count * kOutputChannels, 0,
-                    (wanted - count) * kOutputChannels * sizeof(std::int16_t));
-        // Ran dry: go quiet and rebuild the reserve rather than play scraps.
+    const std::uint64_t consumed =
+        std::min<std::uint64_t>(static_cast<std::uint64_t>(position), available);
+    if (frame < wanted) {
+        // Ran dry: fade out and rebuild the reserve rather than play scraps.
+        fade_out(frame);
         state.primed.store(false, std::memory_order_relaxed);
         state.underruns.fetch_add(1u, std::memory_order_relaxed);
+        state.read_phase = 0.0;
+    } else {
+        state.read_phase = position - static_cast<double>(consumed);
     }
-    state.fifo_read.store(read + count, std::memory_order_release);
+    state.fifo_read.store(read + consumed, std::memory_order_release);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -236,8 +289,19 @@ void advance_locked(AudioState &state, std::uint64_t guest_time_us) {
     // sealing what is already mixed beats waiting for late channels.
     const std::uint64_t queued = state.fifo_write.load(std::memory_order_relaxed) -
         state.fifo_read.load(std::memory_order_acquire);
-    const std::uint64_t safety = queued < kSealChunkFrames * 2u ? 0u : kMixSafetyFrames;
-    const std::uint64_t sealed_frame = guest_frame > safety ? guest_frame - safety : 0u;
+    const bool emergency = queued < kEmergencyFrames;
+    const std::uint64_t safety = emergency ? 0u : kMixSafetyFrames;
+    std::uint64_t sealed_frame = guest_frame > safety ? guest_frame - safety : 0u;
+    // A stream catching up after the clock jumped is still writing into frames
+    // the clock has passed; sealing them now would cut it off with silence.
+    // Streams further behind than the hold have stopped and are not waited for.
+    if (!emergency) {
+        for (const ChannelStream &stream : state.channels) {
+            if (stream.active && stream.lagging && stream.cursor < sealed_frame &&
+                stream.cursor + kCatchUpHoldFrames >= guest_frame)
+                sealed_frame = stream.cursor;
+        }
+    }
     while (sealed_frame >= state.output_frame + kSealChunkFrames) {
         if (!seal_one_chunk(state)) break;
     }
@@ -318,6 +382,7 @@ void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames
                 std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()));
             ++stream.cursor;
         });
+    stream.lagging = stream.cursor < state.clock_frame;
 
     advance_locked(state, guest_time_us);
 }
@@ -327,6 +392,7 @@ void audio_output_advance(std::uint64_t guest_time_us) {
     AudioState &state = audio_state();
     std::lock_guard<std::mutex> guard(state.mutex);
     if (!state.opened) return;
+    state.clock_frame = std::max(state.clock_frame, guest_frame_for(state, guest_time_us));
     advance_locked(state, guest_time_us);
     if (!vcs_configuration().audio.diagnostics) return;
     const auto now = std::chrono::steady_clock::now();
@@ -382,6 +448,7 @@ void audio_output_shutdown() {
     state.fifo_read.store(0u);
     state.timeline_anchored = false;
     state.output_frame = 0u;
+    state.clock_frame = 0u;
     state.failed = false;
     state.late_frames_dropped = 0u;
     state.overrun_frames_dropped = 0u;

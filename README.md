@@ -10,10 +10,10 @@
   <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white" />
   <img alt="Android ARM64 Vulkan" src="https://img.shields.io/badge/Android-ARM64%20%C2%B7%20Vulkan-3DDC84?logo=android&logoColor=white" />
   <img alt="Windows DirectX 12" src="https://img.shields.io/badge/Windows-DirectX%2012-0078D4?logo=windows&logoColor=white" />
-  <img alt="Estado beta" src="https://img.shields.io/badge/estado-beta%200.2.1-orange" />
+  <img alt="Estado beta" src="https://img.shields.io/badge/estado-beta%200.3.0-orange" />
 </p>
 
-> **Estado actual (beta 0.2.1):** el juego se juega en Android con render por GPU (Vulkan), en pantalla completa widescreen, con audio completo (incluidas las voces de las cinemáticas), cámara libre y guardado de estado. Todavía hay detalles pendientes (ver [Problemas conocidos](#problemas-conocidos)).
+> **Estado actual (beta 0.3.0):** el juego se juega en Android con render por GPU (Vulkan), en pantalla completa widescreen, con audio completo (incluidas las voces de las cinemáticas), cámara libre y guardado de estado. Ahora también en celulares de gama baja (modo 30 FPS y resolución de PSP) y en Android de 32 bits. Todavía hay detalles pendientes (ver [Problemas conocidos](#problemas-conocidos)).
 
 ## El proyecto
 
@@ -23,7 +23,8 @@
 
 ### 1. Requisitos
 
-- Android 8.0 o superior, procesador **ARM64** y soporte Vulkan (probado en un Samsung Galaxy S25 Ultra).
+- Android 8.0 o superior, procesador ARM y soporte Vulkan (probado en un Samsung Galaxy S25 Ultra).
+- Hay dos APK: **`arm64`** para casi todos los celulares, y **`armv7` (32 bits)** solo para los que tienen Android de 32 bits (si el de 64 bits no se instala, usa este). El de 32 bits rinde menos.
 - Tu propia copia de **GTA: Vice City Stories para PSP (USA, ULUS10160)**, preparada con [setup_vcs.ps1](setup_vcs.ps1). Ese paso extrae los datos y genera el ELF descifrado.
 
 ### 2. Copia los datos del juego a la carpeta `VCS`
@@ -68,7 +69,10 @@ Guarda el juego completo en el instante exacto —misión, cinemática, posició
 
 - **Guardado de estado:** las mismas ranuras que el botón 💾.
 - **Sensibilidad de cámara:** de Baja a Máxima; se aplica al instante al arrastre, al joystick derecho y al stick del mando.
-- **Resolución interna:** Rendimiento (por debajo de HD, la más fluida), HD, Full HD o nativa de la pantalla. Se aplica al reiniciar la app.
+- **Resolución interna:** PSP original (272 líneas, gama baja), Rendimiento (544), HD, Full HD o nativa de la pantalla. Se aplica al reiniciar la app.
+- **Velocidad (FPS):** 30 FPS, la velocidad original de la PSP y la mitad de trabajo (recomendado en gama baja), o 60 FPS, más fluido. Se aplica al reiniciar la app.
+
+**Celulares de gama baja** (procesadores como Helio G85, Snapdragon 6xx/7xx, o menos de 4 GB de RAM): la primera vez que se abre, la app lo detecta y empieza sola en resolución PSP original y 30 FPS. Se puede cambiar desde ⚙.
 - **Editar posición de controles:** arrastra cada grupo de botones y ajusta su tamaño con − / +.
 - **Restablecer controles:** vuelve al diseño original.
 
@@ -87,7 +91,8 @@ El radar está arriba a la izquierda, donde no lo tapa el pulgar. Si el botón L
 
 ### Problemas conocidos
 
-- En resoluciones altas el juego no siempre llega a velocidad completa. Si va lento, baja a HD o a Rendimiento desde ⚙.
+- En resoluciones altas el juego no siempre llega a velocidad completa. Si va lento, baja la resolución y pon 30 FPS desde ⚙.
+- En celulares muy modestos (Helio G85 y similares) puede no llegar a velocidad completa ni en el modo de gama baja.
 - En algunos puntos (el icono de guardado del juego, el final de algunas misiones) la pantalla puede quedarse en negro. Se está investigando; mientras tanto, usa el guardado de estado antes de esos momentos para no perder avance.
 - Los videos de introducción se saltan (pantalla negra): falta el decodificador de video para Android.
 - El APK beta está firmado con una clave de depuración.

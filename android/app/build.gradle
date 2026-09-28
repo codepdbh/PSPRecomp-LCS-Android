@@ -10,18 +10,25 @@ android {
         applicationId "com.psprecomp.vcs"
         minSdk 26  // AAudio (audio_output_android.cpp) is API 26+
         targetSdk 35
-        versionCode 3
-        versionName "0.2.1-beta"
+        versionCode 4
+        versionName "0.3.0-beta"
 
+        // 64-bit by default. The 32-bit APK, for phones whose Android is still
+        // 32-bit, is a separate build: gradlew assembleDebug -PvcsAbis=armeabi-v7a
         ndk {
-            abiFilters "arm64-v8a"
+            abiFilters(*((project.findProperty("vcsAbis") ?: "arm64-v8a").toString().split(",")))
         }
 
         externalNativeBuild {
             cmake {
                 // Release native code even in the debug APK: the ~180k AOT
                 // functions at the Debug variant's -O0 run the game at ~10% speed.
-                arguments "-DANDROID_STL=c++_static", "-DCMAKE_BUILD_TYPE=Release"
+                // The two AOT switches compile out diagnostics the phone never
+                // uses: a write-watch branch on every guest store, and counters
+                // and hook checks on every translated call.
+                arguments "-DANDROID_STL=c++_static", "-DCMAKE_BUILD_TYPE=Release",
+                          "-DPSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH=ON",
+                          "-DPSPRECOMP_AOT_PRODUCTION_FASTPATHS=ON"
                 cppFlags "-std=c++20"
             }
         }

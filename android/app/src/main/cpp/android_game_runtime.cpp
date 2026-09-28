@@ -14,14 +14,19 @@
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include <jni.h>
+#include <sched.h>
+#include <sys/resource.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace {
 constexpr char kLogTag[] = "VCSAndroid";
@@ -46,6 +51,43 @@ std::string java_string(JNIEnv *env, jstring value) {
     std::string result(utf);
     env->ReleaseStringUTFChars(value, utf);
     return result;
+}
+
+// The recompiled game is one busy thread, and every millisecond it spends on a
+// slow core is a frame the limiter has to jump over. Pin it to the fastest
+// cluster (the prime cores: two at 4.47 GHz against six at 3.53 on a Snapdragon
+// 8 Elite) and raise its priority, so the scheduler cannot park it on a slower
+// core in the middle of a heavy scene.
+void tune_game_thread() {
+    std::vector<std::pair<int, long>> cores;
+    for (int cpu = 0; cpu < 32; ++cpu) {
+        std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                           "/cpufreq/cpuinfo_max_freq");
+        long frequency = 0;
+        if (file >> frequency) cores.emplace_back(cpu, frequency);
+    }
+    long fastest = 0;
+    for (const auto &[cpu, frequency] : cores) fastest = std::max(fastest, frequency);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int chosen = 0;
+    // The top cluster, widened to the next one on chips with a single prime core.
+    for (const double share : {0.90, 0.70}) {
+        CPU_ZERO(&set);
+        chosen = 0;
+        for (const auto &[cpu, frequency] : cores) {
+            if (frequency >= static_cast<long>(fastest * share)) {
+                CPU_SET(cpu, &set);
+                ++chosen;
+            }
+        }
+        if (chosen >= 2) break;
+    }
+    const bool pinned = chosen > 0 && sched_setaffinity(0, sizeof(set), &set) == 0;
+    // -8 is Android's THREAD_PRIORITY_URGENT_DISPLAY, which apps may use.
+    const bool raised = setpriority(PRIO_PROCESS, 0, -8) == 0;
+    __android_log_print(ANDROID_LOG_INFO, kLogTag, "game thread: %d fastest cores (%ld kHz) %s, priority %s",
+                        chosen, fastest, pinned ? "pinned" : "not pinned", raised ? "raised" : "unchanged");
 }
 
 void run_game(std::filesystem::path root, std::filesystem::path app_data) {
@@ -130,6 +172,9 @@ void run_game(std::filesystem::path root, std::filesystem::path app_data) {
                 previous_pc = pc;
             }
         });
+        // After the Vulkan device exists, so its driver threads (created from
+        // this one) do not inherit the pinning and crowd the same cores.
+        tune_game_thread();
         runtime->run(elf.runtime_entry(), 4'000'000'000ull);
         progress_monitor_stop.store(true, std::memory_order_release);
         if (progress_monitor.joinable()) progress_monitor.join();

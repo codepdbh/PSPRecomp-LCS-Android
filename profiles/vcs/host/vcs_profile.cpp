@@ -16,6 +16,8 @@
 
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -2492,8 +2494,17 @@ std::uint64_t audio_queue_buffer(AudioChannelState &channel, std::uint32_t frame
     const auto elapsed_us = [&](std::uint64_t sample_frames) {
         return (sample_frames * 1000000ull) / rate;
     };
+    // How far a stream may fall behind the clock and still continue where it
+    // left off. A late frame makes the frame limiter move the clock forward by
+    // up to eight vblanks (~133 ms) at once; restarting every stream at the new
+    // time then left that much silence in each of them -- the crackle heard
+    // whenever the frame rate dipped. Within this window the stream stays
+    // contiguous instead, the caller's blocking waits come back immediately
+    // until it has caught up, and the host mix waits for it before sealing
+    // (audio_output_android.cpp).
+    constexpr std::uint64_t kCatchUpWindowUs = 250000u;
     std::uint64_t start = channel.queue_anchor_us + elapsed_us(channel.queued_frames);
-    if (!channel.queue_active || start < virtual_time_us) {
+    if (!channel.queue_active || start + kCatchUpWindowUs < virtual_time_us) {
         // Either the first buffer of a stream, or the guest fell far enough
         // behind that the queue really did drain.  Both are genuine
         // discontinuities: restart the anchor here.
@@ -4333,6 +4344,108 @@ void write_diag_line(const std::ostringstream &line) {
 // would turn a slow section into a fast-forward. The anchor is reset instead,
 // so a slow stretch is simply slow and normal speed resumes after it.
 //
+// Set when a save state replaces virtual_time_us; limit_frame_rate re-anchors.
+std::atomic_bool frame_limiter_resync{};
+
+#if defined(__ANDROID__)
+// Android Dynamic Performance Framework: each vblank tells the system how long
+// the guest's work took against the frame budget, so it raises clocks ahead of
+// a heavy stretch instead of reacting after frames were already lost. Loaded
+// by name because the API is 33+ and the app still runs on 26.
+void report_frame_work(std::chrono::nanoseconds work) {
+    using GetManager = void *(*)();
+    using CreateSession = void *(*)(void *, const std::int32_t *, std::size_t, std::int64_t);
+    using ReportWork = int (*)(void *, std::int64_t);
+    static ReportWork report = nullptr;
+    static void *session = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        if (void *library = dlopen("libandroid.so", RTLD_NOW)) {
+            const auto get = reinterpret_cast<GetManager>(dlsym(library, "APerformanceHint_getManager"));
+            const auto create = reinterpret_cast<CreateSession>(dlsym(library, "APerformanceHint_createSession"));
+            report = reinterpret_cast<ReportWork>(dlsym(library, "APerformanceHint_reportActualWorkDuration"));
+            void *manager = get != nullptr && create != nullptr && report != nullptr ? get() : nullptr;
+            const std::int32_t thread = static_cast<std::int32_t>(gettid());
+            if (manager != nullptr)
+                session = create(manager, &thread, 1u,
+                                 static_cast<std::int64_t>(virtual_vblank_period_us()) * 1000);
+        }
+        __android_log_print(ANDROID_LOG_INFO, "VCSPerf", "performance hint session %s",
+                            session != nullptr ? "active" : "unavailable");
+    }
+    if (session != nullptr && work.count() > 0) (void)report(session, work.count());
+}
+
+// What each vblank cost, summarised every 120 so a stutter can be attributed:
+// the worst frame's split between GE (display lists), disc reads and the
+// present, the rest being the game's own code.
+struct FramePerfWindow {
+    std::uint32_t frames{};
+    std::int64_t work_total_us{};
+    std::int64_t worst_work_us{};
+    std::int64_t worst_ge_us{}, worst_io_us{}, worst_present_us{};
+    std::uint32_t over_budget{};   // work longer than one vblank
+    std::uint32_t hitches{};       // work longer than two
+    std::uint64_t texture_uploads_start{};
+    bool started{};
+};
+
+void note_frame_perf(std::chrono::nanoseconds work) {
+    static FramePerfWindow window;
+    const auto us = [](std::chrono::steady_clock::duration d) {
+        return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+    };
+    const std::int64_t work_us = work.count() / 1000;
+    // With PSPRECOMP_FRAME_TIME_DIAG the per-vblank diagnostic owns and resets these.
+    const bool own_counters = !frame_time_diag_enabled();
+    const std::int64_t ge_us = own_counters ? us(frame_time_stats.ge_time) : 0;
+    const std::int64_t io_us = own_counters ? us(io_host_time_this_vblank) : 0;
+    const std::int64_t present_us = own_counters ? us(frame_time_stats.present_time) : 0;
+    if (own_counters) {
+        frame_time_stats.ge_time = {};
+        frame_time_stats.present_time = {};
+        io_host_time_this_vblank = {};
+    }
+    if (!window.started) {
+        window.started = true;
+        window.texture_uploads_start = ge_gpu_backend_report().decoded_texture_uploads;
+    }
+    const std::int64_t budget_us = static_cast<std::int64_t>(virtual_vblank_period_us());
+    ++window.frames;
+    window.work_total_us += work_us;
+    if (work_us > budget_us) ++window.over_budget;
+    if (work_us > budget_us * 2) ++window.hitches;
+    if (work_us > window.worst_work_us) {
+        window.worst_work_us = work_us;
+        window.worst_ge_us = ge_us;
+        window.worst_io_us = io_us;
+        window.worst_present_us = present_us;
+    }
+    if (window.frames < 120u) return;
+    const std::uint64_t uploads = ge_gpu_backend_report().decoded_texture_uploads;
+    __android_log_print(ANDROID_LOG_INFO, "VCSPerf",
+        "work avg=%.1fms worst=%.1fms (ge=%.1f io=%.1f present=%.1f) over_budget=%u hitches=%u tex_uploads=%llu",
+        window.work_total_us / 1000.0 / window.frames, window.worst_work_us / 1000.0,
+        window.worst_ge_us / 1000.0, window.worst_io_us / 1000.0, window.worst_present_us / 1000.0,
+        window.over_budget, window.hitches,
+        static_cast<unsigned long long>(uploads - window.texture_uploads_start));
+    window = FramePerfWindow{};
+    window.started = true;
+    window.texture_uploads_start = uploads;
+}
+#endif
+
+// Timing of GE, present and disc reads: always on Android, where it feeds the
+// performance hint and the VCSPerf summary; elsewhere only for the diagnostic.
+bool perf_timing_enabled() {
+#if defined(__ANDROID__)
+    return true;
+#else
+    return frame_time_diag_enabled();
+#endif
+}
+
 // PSPRECOMP_FRAME_LIMIT=0 disables it, which is what performance measurement
 // needs -- with the limiter on, frame_us just reads back the target period.
 void limit_frame_rate() {
@@ -4340,11 +4453,31 @@ void limit_frame_rate() {
         const char *text = std::getenv("PSPRECOMP_FRAME_LIMIT");
         return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
     }();
+#if defined(__ANDROID__)
+    // Work is everything since the previous vblank's wait ended.
+    static std::chrono::steady_clock::time_point work_start{};
+    {
+        const auto work_end = std::chrono::steady_clock::now();
+        if (work_start != std::chrono::steady_clock::time_point{}) {
+            const auto work = std::chrono::duration_cast<std::chrono::nanoseconds>(work_end - work_start);
+            report_frame_work(work);
+            note_frame_perf(work);
+        }
+        work_start = work_end;
+    }
+    struct WorkRestart {
+        ~WorkRestart() { work_start = std::chrono::steady_clock::now(); }
+    } work_restart;
+#endif
     if (!enabled) return;
 
     static bool anchored = false;
     static std::chrono::steady_clock::time_point wall_anchor{};
     static std::uint64_t guest_anchor = 0u;
+    // A save state replaces the guest clock wholesale; pacing against the old
+    // anchor slept until the wall clock "caught up" -- minutes, for a state
+    // saved later in its session than this one had run.
+    if (frame_limiter_resync.exchange(false, std::memory_order_relaxed)) anchored = false;
     if (!anchored) {
         anchored = true;
         wall_anchor = std::chrono::steady_clock::now();
@@ -4391,9 +4524,23 @@ void limit_frame_rate() {
         guest_anchor = virtual_time_us;
         return;
     }
+    // Never more than a second ahead: any bigger gap means the clock itself was
+    // replaced, not that the frame was early.
+    if (target - now > std::chrono::seconds(1)) {
+        wall_anchor = now;
+        guest_anchor = virtual_time_us;
+        return;
+    }
     // Sleep the bulk, spin the tail: a plain sleep_until overshoots by up to a
-    // scheduler tick, which at 60 Hz is most of a frame.
+    // scheduler tick, which at 60 Hz is most of a frame. Android's timers are
+    // high-resolution (well under 0.1 ms late), and spinning on a phone is heat
+    // on the fastest core -- and heat is what throttles it into stutters after
+    // a while of play -- so the tail there is kept short.
+#if defined(__ANDROID__)
+    constexpr auto spin_margin = std::chrono::microseconds(250);
+#else
     constexpr auto spin_margin = std::chrono::microseconds(1500);
+#endif
     if (target - now > spin_margin) std::this_thread::sleep_until(target - spin_margin);
     while (std::chrono::steady_clock::now() < target) std::this_thread::yield();
 }
@@ -4402,7 +4549,7 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
                      std::vector<GuestCallbackInvocation> &callbacks,
                      const std::atomic<std::uint32_t> *async_stall = nullptr) {
     constexpr std::uint64_t kMaximumCommandsPerRun = 4'000'000u;
-    const bool time_ge = frame_time_diag_enabled();
+    const bool time_ge = perf_timing_enabled();
     const bool ge_histogram = ge_histogram_diag_enabled();
     const bool count_ge_commands = ge_phase_diag_line_enabled();
     const auto ge_entry_time = time_ge
@@ -5780,8 +5927,10 @@ void load_machine_state(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx,
     ++ge_draw_state_revision;
     ++ge_lighting_state_revision;
     ++ge_camera_state_revision;
-    for (std::uint32_t channel = 0u; channel < audio_channels.size(); ++channel)
-        audio_output_reset_channel(channel);
+    // The guest clock jumped to the state's: the limiter and the host mix, both
+    // anchored to the old clock, start over from the new one.
+    frame_limiter_resync.store(true, std::memory_order_relaxed);
+    audio_output_shutdown();
     refresh_vcs_post_dispatch_hook();
     // Force a thread switch even when the saved thread has the running one's
     // uid, so the translated code drops whatever registers it still caches.
@@ -7795,7 +7944,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         display_window_set_aspect_lock(
             !movie_output_buffers.empty() &&
             movie_output_buffers.count(normalize_ram_address(display_state.frame_buffer)) != 0u);
-        const auto present_entry = frame_time_diag_enabled()
+        const auto present_entry = perf_timing_enabled()
             ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const bool gpu_frame_ready = ge_gpu_backend_finish_color_frame(display_vblank_index);
         // VCS only fills the displayed framebuffer on every other vblank, so the
@@ -7847,7 +7996,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ++swapchain_presents;
         }
         if (gpu_frame_ready) dump_gpu_internal_frame_if_requested(display_vblank_index);
-        if (frame_time_diag_enabled())
+        if (perf_timing_enabled())
             frame_time_stats.present_time += std::chrono::steady_clock::now() - present_entry;
         limit_frame_rate();
         if (display_window_close_requested()) {
@@ -8090,12 +8239,10 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         // producing it.
         const std::uint64_t start_us = audio_queue_buffer(state, state.sample_count);
         if (samples != 0u && vcs::audio_output_enabled()) {
+            // One block copy: guest and host are both little-endian.
             std::vector<std::int16_t> pcm(bytes / sizeof(std::int16_t));
-            for (std::size_t index = 0u; index < pcm.size(); ++index) {
-                pcm[index] = static_cast<std::int16_t>(
-                    rt.memory().aot_load16(samples +
-                        static_cast<std::uint32_t>(index * sizeof(std::int16_t))));
-            }
+            rt.memory().copy_out(samples, std::span<std::uint8_t>(
+                reinterpret_cast<std::uint8_t *>(pcm.data()), pcm.size() * sizeof(std::int16_t)));
             vcs::audio_output_submit(pcm, state.sample_count, channels == 2u, left, right,
                                      state.frequency, channel, start_us);
         }
@@ -8211,11 +8358,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const std::uint64_t start_us = audio_queue_buffer(state, state.sample_count);
             if (buffer != 0u && vcs::audio_output_enabled()) {
                 std::vector<std::int16_t> pcm(bytes / sizeof(std::int16_t));
-                for (std::size_t index = 0u; index < pcm.size(); ++index) {
-                    pcm[index] = static_cast<std::int16_t>(
-                        rt.memory().aot_load16(buffer +
-                            static_cast<std::uint32_t>(index * sizeof(std::int16_t))));
-                }
+                rt.memory().copy_out(buffer, std::span<std::uint8_t>(
+                    reinterpret_cast<std::uint8_t *>(pcm.data()), pcm.size() * sizeof(std::int16_t)));
                 vcs::audio_output_submit(pcm, state.sample_count, true,
                                          volume, volume, state.frequency, 8u, start_us);
             }
@@ -10105,7 +10249,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     ctx.set_gpr(2, 0x80010009u);
                     return;
                 }
-                const bool time_io = frame_time_diag_enabled();
+                const bool time_io = perf_timing_enabled();
                 const auto io_entry = time_io ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
                 const std::size_t read = read_virtual_disc(
@@ -10169,7 +10313,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 ctx.set_gpr(2, 0x80010009u);
                 return;
             }
-            const bool time_io = frame_time_diag_enabled();
+            const bool time_io = perf_timing_enabled();
             const auto io_entry = time_io ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
             it->second.read(reinterpret_cast<char *>(guest_destination),

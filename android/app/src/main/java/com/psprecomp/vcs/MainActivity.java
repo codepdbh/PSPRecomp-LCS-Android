@@ -246,6 +246,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         }
         startRequested = true;
         gameStartAt = SystemClock.uptimeMillis();
+        applyLowEndDefaultsOnce(); // before the native side reads the INI
         nativeStartGame(gameRoot.getAbsolutePath(), getFilesDir().getAbsolutePath());
     }
 
@@ -493,6 +494,9 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     private List<ResolutionChoice> resolutionChoices() {
         List<ResolutionChoice> choices = new ArrayList<>();
+        // The PSP's own 272 lines, widened to the panel: for low-end phones.
+        choices.add(new ResolutionChoice(String.format(Locale.ROOT,
+            "PSP original — %d×272 (gama baja)", widescreenWidth(272)), "Scale", 1));
         // Below HD: twice the PSP's own height, for the smoothest frame rate.
         choices.add(new ResolutionChoice(String.format(Locale.ROOT,
             "Rendimiento — %d×544 (más fluido)", widescreenWidth(544)), "Scale", 2));
@@ -507,20 +511,82 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     private void showSettingsDialog() {
         controls.releaseAll();
-        String[] items = {"Guardado de estado…", "Resolución interna…", "Sensibilidad de cámara…",
-                          "Editar posición de controles", "Restablecer controles"};
+        String[] items = {"Guardado de estado…", "Resolución interna…", "Velocidad (FPS)…",
+                          "Sensibilidad de cámara…", "Editar posición de controles", "Restablecer controles"};
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Ajustes")
             .setItems(items, (dialog, which) -> {
                 if (which == 0) showSaveStateDialog();
                 else if (which == 1) showResolutionDialog();
-                else if (which == 2) showCameraSensitivityDialog();
-                else if (which == 3) controls.setEditMode(true);
+                else if (which == 2) showFrameRateDialog();
+                else if (which == 3) showCameraSensitivityDialog();
+                else if (which == 4) controls.setEditMode(true);
                 else controls.resetLayout();
             })
             .setNegativeButton("Cerrar", null)
             .setOnDismissListener(d -> hideSystemBars())
             .show();
+    }
+
+    /**
+     * The game's frame rate. VCS itself draws 30 frames a second on the PSP;
+     * 60 doubles every frame's work, which a low-end phone cannot keep up with.
+     */
+    private void showFrameRateDialog() {
+        controls.releaseAll();
+        String[] labels = {"30 FPS — original de PSP (recomendado en gama baja)",
+                           "60 FPS — más fluido (requiere un buen celular)"};
+        int current = readConfigInt("Timing", "framerate", 60) <= 30 ? 0 : 1;
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Velocidad (FPS)")
+            .setSingleChoiceItems(labels, current, (dialog, which) -> {
+                dialog.dismiss();
+                if (which == current) return;
+                if (!writeConfigKeys("Timing", new String[]{"FrameRate"},
+                        new String[]{which == 0 ? "30" : "60"}, "fps", "targetfps")) {
+                    statusView.setVisibility(View.VISIBLE);
+                    statusView.setText("No se pudo guardar la velocidad.");
+                    return;
+                }
+                confirmRestart();
+            })
+            .setNegativeButton("Cancelar", null)
+            .setOnDismissListener(d -> hideSystemBars())
+            .show();
+    }
+
+    /**
+     * First launch on a slow phone starts at the PSP's own resolution and frame
+     * rate, so a tester with a Helio G85 does not meet the game at its heaviest.
+     * Settings the player already chose are left alone.
+     */
+    private void applyLowEndDefaultsOnce() {
+        android.content.SharedPreferences prefs = getSharedPreferences("controls", Context.MODE_PRIVATE);
+        if (prefs.getBoolean("low_end_checked", false)) return;
+        prefs.edit().putBoolean("low_end_checked", true).apply();
+        long fastestKhz = 0;
+        for (int cpu = 0; cpu < 32; ++cpu) {
+            File file = new File("/sys/devices/system/cpu/cpu" + cpu + "/cpufreq/cpuinfo_max_freq");
+            if (!file.isFile()) continue;
+            try {
+                fastestKhz = Math.max(fastestKhz,
+                    Long.parseLong(new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8).trim()));
+            } catch (IOException | NumberFormatException ignored) {
+            }
+        }
+        android.app.ActivityManager activity = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        android.app.ActivityManager.MemoryInfo memory = new android.app.ActivityManager.MemoryInfo();
+        if (activity != null) activity.getMemoryInfo(memory);
+        // Below ~2.6 GHz peak (Helio G-series, Snapdragon 6xx/7xx) or under 4 GB.
+        boolean lowEnd = (fastestKhz > 0 && fastestKhz < 2_600_000L) ||
+            (activity != null && activity.isLowRamDevice()) ||
+            (memory.totalMem > 0 && memory.totalMem < 4L * 1024 * 1024 * 1024);
+        if (!lowEnd) return;
+        if (readConfigValue("Rendering", "internalscale") == null &&
+            readConfigValue("Rendering", "internalresolutionmode") == null)
+            writeResolution(new ResolutionChoice("", "Scale", 1));
+        if (readConfigValue("Timing", "framerate") == null)
+            writeConfigKeys("Timing", new String[]{"FrameRate"}, new String[]{"30"}, "fps", "targetfps");
     }
 
     /** How far the camera turns per finger drag. Takes effect at once. */
@@ -683,35 +749,59 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         return -1;
     }
 
-    /** Rewrites only the resolution keys of [Rendering], keeping everything else in the file. */
-    private boolean writeResolution(ResolutionChoice choice) {
-        List<String> lines = readConfig();
-        List<String> out = new ArrayList<>();
-        boolean inRendering = false, sawRendering = false;
-        List<String> ours = new ArrayList<>();
-        ours.add("InternalResolutionMode=" + choice.mode);
-        if (choice.scale > 0) ours.add("InternalScale=" + choice.scale);
-        for (String raw : lines) {
+    /** The value of `key` (lower case) in `[section]`, or null when absent. */
+    private String readConfigValue(String section, String key) {
+        boolean inSection = false;
+        String found = null;
+        for (String raw : readConfig()) {
             String line = raw.trim();
             if (line.startsWith("[")) {
-                inRendering = line.equalsIgnoreCase("[Rendering]");
+                inSection = line.equalsIgnoreCase("[" + section + "]");
+                continue;
+            }
+            if (inSection && keyOf(line).equals(key)) found = valueOf(line);
+        }
+        return found;
+    }
+
+    private int readConfigInt(String section, String key, int fallback) {
+        String value = readConfigValue(section, key);
+        try {
+            return value != null ? Integer.parseInt(value) : fallback;
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    /**
+     * Sets `keys` to `values` in `[section]`, dropping any earlier spelling of
+     * them (and of `aliases`) and keeping everything else in the file.
+     */
+    private boolean writeConfigKeys(String section, String[] keys, String[] values, String... aliases) {
+        List<String> replaced = new ArrayList<>();
+        for (String key : keys) replaced.add(key.toLowerCase(Locale.ROOT));
+        for (String alias : aliases) replaced.add(alias.toLowerCase(Locale.ROOT));
+        List<String> ours = new ArrayList<>();
+        for (int i = 0; i < keys.length; ++i) ours.add(keys[i] + "=" + values[i]);
+        List<String> out = new ArrayList<>();
+        boolean inSection = false, sawSection = false;
+        for (String raw : readConfig()) {
+            String line = raw.trim();
+            if (line.startsWith("[")) {
+                inSection = line.equalsIgnoreCase("[" + section + "]");
                 out.add(raw);
-                if (inRendering) {
-                    sawRendering = true;
+                if (inSection && !sawSection) {
+                    sawSection = true;
                     out.addAll(ours);
                 }
                 continue;
             }
-            if (inRendering) {
-                String key = keyOf(line);
-                if (key.equals("internalresolutionmode") || key.equals("internalmode") ||
-                    key.equals("internalscale") || key.equals("scale")) continue;
-            }
+            if (inSection && replaced.contains(keyOf(line))) continue;
             out.add(raw);
         }
-        if (!sawRendering) {
-            out.add("[Rendering]");
-            out.add("Backend=Vulkan");
+        if (!sawSection) {
+            out.add("[" + section + "]");
+            if (section.equals("Rendering")) out.add("Backend=Vulkan");
             out.addAll(ours);
         }
         try {
@@ -720,6 +810,15 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         } catch (IOException e) {
             return false;
         }
+    }
+
+    /** Rewrites only the resolution keys of [Rendering], keeping everything else in the file. */
+    private boolean writeResolution(ResolutionChoice choice) {
+        if (choice.scale > 0)
+            return writeConfigKeys("Rendering", new String[]{"InternalResolutionMode", "InternalScale"},
+                new String[]{choice.mode, String.valueOf(choice.scale)}, "internalmode", "scale");
+        return writeConfigKeys("Rendering", new String[]{"InternalResolutionMode"},
+            new String[]{choice.mode}, "internalmode", "internalscale", "scale");
     }
 
     // --- Surface ---------------------------------------------------------------------------
