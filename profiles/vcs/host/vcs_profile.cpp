@@ -4441,6 +4441,20 @@ void note_frame_perf(std::chrono::nanoseconds work) {
     }
     if (window.frames < 120u) return;
     const std::uint64_t uploads = ge_gpu_backend_report().decoded_texture_uploads;
+    {
+        // GE split per frame, when PSPRECOMP_GE_PHASE_DIAG turns the timers on.
+        const vcs::GePhaseTotals phases = vcs::ge_phase_totals();
+        const auto ms = [&](std::uint64_t ns) { return ns / 1e6 / window.frames; };
+        if (phases.draw_setup_ns + phases.vertex_decode_ns + phases.triangle_prep_ns != 0u) {
+            __android_log_print(ANDROID_LOG_INFO, "VCSPerf",
+                "ge split/frame: setup=%.2f texupload=%.2f vdecode=%.2f stage=%.2f triprep=%.2f accum=%.2f pixel=%.2f draws=%.0f verts=%.0f",
+                ms(phases.draw_setup_ns), ms(phases.texture_upload_ns), ms(phases.vertex_decode_ns),
+                ms(phases.gpu_stage_ns), ms(phases.triangle_prep_ns), ms(phases.gpu_accumulate_ns),
+                ms(phases.pixel_loop_ns), static_cast<double>(phases.primitives) / window.frames,
+                static_cast<double>(phases.vertices) / window.frames);
+            vcs::reset_ge_phase_totals();
+        }
+    }
     __android_log_print(ANDROID_LOG_INFO, "VCSPerf",
         "work avg=%.1fms worst=%.1fms (ge=%.1f io=%.1f present=%.1f) over_budget=%u hitches=%u tex_uploads=%llu",
         window.work_total_us / 1000.0 / window.frames, window.worst_work_us / 1000.0,

@@ -1415,7 +1415,9 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
                 static_cast<unsigned long long>(t.frames));
         g_frame_timing = {};
     }
-    std::vector<GeGpuVertex> selected;
+    // Batches keep their offsets into s.vertices, which is uploaded whole in
+    // one copy. Gathering each selected batch into a second vector first cost
+    // an extra copy of every vertex (and its allocations) on every frame.
     std::vector<DrawBatch> world_batches;
     std::vector<DrawBatch> display_batches;
     try {
@@ -1424,10 +1426,7 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
             for (const DrawBatch &batch : s.batches) {
                 if ((batch.draw.framebuffer_address & 0x001FFFF0u) != address)
                     continue;
-                const auto first = static_cast<std::uint32_t>(selected.size());
-                selected.insert(selected.end(), s.vertices.begin() + batch.first,
-                                s.vertices.begin() + batch.first + batch.count);
-                output.push_back({batch.draw, first, batch.count,
+                output.push_back({batch.draw, batch.first, batch.count,
                                   batch.texture_key, batch.textured,
                                   batch.framebuffer_feedback});
             }
@@ -1466,6 +1465,9 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
         s.batches.clear();
         return false;
     }
+    const std::size_t vertex_bytes = s.vertices.size() * sizeof(GeGpuVertex);
+    if (vertex_bytes != 0u && vertex_bytes <= kVertexCapacity)
+        std::memcpy(s.vertices_gpu.mapped, s.vertices.data(), vertex_bytes);
     s.vertices.clear();
     s.batches.clear();
     s.frame_has_scene = false;
@@ -1477,8 +1479,8 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
     // world, and LCS showed a black screen. Such a frame renders the world
     // pass only and presents nothing.
     const bool presents = !display_batches.empty();
-    if (selected.empty() || (!presents && world_batches.empty()) ||
-        selected.size() * sizeof(GeGpuVertex) > kVertexCapacity) return false;
+    if (vertex_bytes == 0u || (!presents && world_batches.empty()) ||
+        vertex_bytes > kVertexCapacity) return false;
     // Menus are rendered here too. They used to be handed back to the software
     // rasterizer after two 2D-only frames, but the CPU raster of the surface
     // the menu draws into is skipped while the GPU owns it - so the picture
@@ -1490,7 +1492,6 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
     s.consecutive_2d_frames = 0u;
     s.software_menu_active = false;
     s.report.software_fallback_frame = false;
-    std::memcpy(s.vertices_gpu.mapped, selected.data(), selected.size() * sizeof(GeGpuVertex));
     VkResult result = vkResetCommandPool(s.device, s.command_pool, 0u);
     if (result != VK_SUCCESS) { log_error("vkResetCommandPool", result); return false; }
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
