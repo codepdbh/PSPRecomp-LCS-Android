@@ -84,6 +84,7 @@ struct VulkanPreview {
     bool frame_in_flight{};
     bool fence_waited{};
     std::uint64_t in_flight_vblank{};
+    bool in_flight_presents{};   // false: a world-only frame, no readback
     unsigned consecutive_2d_frames{};
     VkInstance instance{VK_NULL_HANDLE};
     VkPhysicalDevice physical{VK_NULL_HANDLE};
@@ -1307,6 +1308,11 @@ bool collect_in_flight(VulkanPreview &s) {
         texture.pending = false;
         texture.recorded = false;
     }
+    if (!s.in_flight_presents) {
+        // A world-only frame: nothing new to show.
+        s.frame_in_flight = false;
+        return false;
+    }
     const std::uint64_t copy_start = steady_ns();
     std::memcpy(s.frame_rgba.data(), s.readback.mapped, s.frame_rgba.size());
     g_frame_timing.copy_ns += steady_ns() - copy_start;
@@ -1464,7 +1470,14 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
     s.batches.clear();
     s.frame_has_scene = false;
     s.composited_last_frame = !world_batches.empty();
-    if (selected.empty() || display_batches.empty() ||
+    // A vblank can draw the world without composing it: LCS renders the world
+    // on one vblank and composites it into the display on the next, where VCS
+    // does both at once. That world still has to reach the GPU image the next
+    // composition samples -- dropping it (as this used to) composed an empty
+    // world, and LCS showed a black screen. Such a frame renders the world
+    // pass only and presents nothing.
+    const bool presents = !display_batches.empty();
+    if (selected.empty() || (!presents && world_batches.empty()) ||
         selected.size() * sizeof(GeGpuVertex) > kVertexCapacity) return false;
     // Menus are rendered here too. They used to be handed back to the software
     // rasterizer after two 2D-only frames, but the CPU raster of the surface
@@ -1627,6 +1640,7 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
             1u, &world_barrier);
     }
+    if (presents) {
     pass.framebuffer = s.framebuffer;
     pass.renderArea = {{0, 0}, {s.display_width, s.display_height}};
     vkCmdBeginRenderPass(s.command, &pass, VK_SUBPASS_CONTENTS_INLINE);
@@ -1651,6 +1665,7 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
     copy.imageExtent = {s.display_width, s.display_height, 1u};
     vkCmdCopyImageToBuffer(s.command, s.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            s.readback.handle, 1u, &copy);
+    }
     result = vkEndCommandBuffer(s.command);
     if (result != VK_SUCCESS) { log_error("vkEndCommandBuffer", result); return false; }
     result = vkResetFences(s.device, 1u, &s.fence);
@@ -1661,6 +1676,7 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
     result = vkQueueSubmit(s.queue, 1u, &submit, s.fence);
     if (result != VK_SUCCESS) { log_error("vkQueueSubmit", result); return false; }
     s.frame_in_flight = true;
+    s.in_flight_presents = presents;
     s.fence_waited = false;
     s.in_flight_vblank = vblank;
     // VulkanPreview is an explicit visual-inspection mode. The software GE is
