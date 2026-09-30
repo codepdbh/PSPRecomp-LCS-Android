@@ -19,6 +19,19 @@
 
 [PSPRecomp](https://github.com/jessicanataliagta/PSPRecomp) traduce el código Allegrex de la PSP a C++ nativo. Este repositorio añade el perfil de VCS, los servicios de plataforma para Android y Windows, y la app Android. El código del juego se recompila; los datos del juego se leen de una copia propia del usuario.
 
+## Liberty City Stories (en desarrollo)
+
+<p align="center">
+  <img src="assets/ICONOLCS.png" alt="Icono de LCS Android" width="160" />
+</p>
+
+**GTA: Liberty City Stories (PSP, USA, ULUS10041)** también corre en Android con este mismo código: comparte el motor de VCS, así que usa los mismos servicios de PSP, el render Vulkan, el audio, los controles, el guardado de estado y los ajustes. Es una app aparte, **LCS Android** (`com.psprecomp.lcs`), que se instala junto a la de VCS.
+
+- Los datos van en **Almacenamiento interno/LCS**, con la misma estructura que VCS: `LCS/PSP_GAME/…` y el ejecutable descifrado en `LCS/PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF`.
+- El ejecutable descifrado se obtiene de tu propia copia con PPSSPP (volcado del EBOOT descifrado). Detalles en [profiles/lcs](profiles/lcs/README.md).
+- **Estado:** arranca, dibuja por GPU, tiene audio y corre la intro. Aún sin modo 60 FPS, joystick de cámara ni Project2DFX, y sin multijugador (responde "sin red").
+- Compilar: `gradlew assembleLcsDebug` (y `assembleVcsDebug` para VCS).
+
 ## Instalación en Android
 
 ### 1. Requisitos

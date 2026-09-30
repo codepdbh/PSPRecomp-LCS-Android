@@ -87,7 +87,15 @@ struct InternalResolutionDimensions {
 struct RenderingConfiguration {
     // PSP-native remains authoritative by default. Higher modes allocate a
     // genuinely larger render target; they are not presentation upscalers.
+#if defined(__ANDROID__)
+    // Vulkan is the Android renderer. Software used to be the default here as
+    // well, so a fresh install that never wrote an INI -- every tester who had
+    // not touched the resolution, and every LCS start -- drew each frame on
+    // the CPU and never uploaded a texture to the GPU.
+    RenderingBackend backend{RenderingBackend::Vulkan};
+#else
     RenderingBackend backend{RenderingBackend::Software};
+#endif
 #if defined(__ANDROID__)
     // A phone panel is 1080p or more; 480x272 on it is a blur of big pixels.
     // 3x (1440x816) is the minimum that reads as HD there, and the Vulkan

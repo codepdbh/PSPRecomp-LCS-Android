@@ -1,4 +1,5 @@
 #include "vcs_profile.hpp"
+#include "guest_title.hpp"
 #include "vcs_native_fast_paths.hpp"
 #include "audio_output.hpp"
 #include "display_window.hpp"
@@ -30,6 +31,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <ctime>
 #include <iostream>
 #include <cstdint>
 #include <fstream>
@@ -982,6 +984,8 @@ constexpr std::uint32_t kGuestFrameLimiterContinue = 0x08A070D0u;
 constexpr std::int32_t kGuestFrameCounterGpOffset = -8852;
 
 std::uint32_t configured_game_frame_rate() noexcept {
+    // Anything above 30 needs the frame-limiter patch, which exists for VCS only.
+    if (kTitleLcs) return 30u;
     return vcs_configuration().timing.frame_rate;
 }
 
@@ -6023,9 +6027,299 @@ bool save_state_request(bool save, const std::filesystem::path &file, std::strin
     return save_state_mailbox.ok;
 }
 
+namespace {
+// Result of the last asynchronous operation per descriptor, collected by
+// sceIoWaitAsync / sceIoPollAsync. Host storage answers faster than a UMD
+// could, so each operation completes on the call and only its result waits.
+std::unordered_map<std::int32_t, std::int64_t> async_io_results;
+
+constexpr std::uint32_t kErrorNoAsync = 0x8002032Au;   // SCE_KERNEL_ERROR_NOASYNC
+constexpr std::uint32_t kErrorBadFile = 0x80010009u;
+
+void store_guest64(psprecomp::Runtime &rt, std::uint32_t address, std::int64_t value) {
+    if (address == 0u || !rt.memory().contains(address, 8u)) return;
+    const auto bits = static_cast<std::uint64_t>(value);
+    rt.memory().store32(address, static_cast<std::uint32_t>(bits));
+    rt.memory().store32(address + 4u, static_cast<std::uint32_t>(bits >> 32u));
+}
+
+std::int64_t sign_extended_result(std::uint32_t v0) {
+    return static_cast<std::int64_t>(static_cast<std::int32_t>(v0));
+}
+
+// The file calls LCS makes and VCS does not: the asynchronous family, plus
+// write, mkdir, rename and cancel. Each async call runs the synchronous
+// implementation on a scratch copy of the context, so paths, virtual disc
+// handles and errors behave exactly as they do for the blocking calls.
+template <class Open, class Read, class Seek, class Close>
+void register_async_and_extra_io(psprecomp::Runtime &runtime, Open io_open, Read io_read,
+                                 Seek io_lseek, Close io_close) {
+    // sceIoOpenAsync(path, flags, mode): the descriptor is returned at once.
+    runtime.register_hle("IoFileMgrForUser", 0x89AA9906u,
+        [io_open](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            psprecomp::AllegrexContext scratch = ctx;
+            io_open(rt, scratch);
+            const std::uint32_t result = scratch.gpr[2];
+            if (static_cast<std::int32_t>(result) >= 0)
+                async_io_results[static_cast<std::int32_t>(result)] = sign_extended_result(result);
+            ctx.set_gpr(2, result);
+        });
+    // sceIoReadAsync(fd, buffer, size)
+    runtime.register_hle("IoFileMgrForUser", 0xA0B5A7C2u,
+        [io_read](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            psprecomp::AllegrexContext scratch = ctx;
+            io_read(rt, scratch, false);
+            async_io_results[static_cast<std::int32_t>(ctx.gpr[4])] = sign_extended_result(scratch.gpr[2]);
+            ctx.set_gpr(2, 0u);
+        });
+    // sceIoLseekAsync(fd, offset (a2:a3), whence (t0)): same registers as sceIoLseek.
+    runtime.register_hle("IoFileMgrForUser", 0x71B19E77u,
+        [io_lseek](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            psprecomp::AllegrexContext scratch = ctx;
+            io_lseek(rt, scratch);
+            const std::uint64_t position = static_cast<std::uint64_t>(scratch.gpr[2]) |
+                (static_cast<std::uint64_t>(scratch.gpr[3]) << 32u);
+            async_io_results[static_cast<std::int32_t>(ctx.gpr[4])] = static_cast<std::int64_t>(position);
+            ctx.set_gpr(2, 0u);
+        });
+    // sceIoCloseAsync(fd)
+    runtime.register_hle("IoFileMgrForUser", 0xFF5940B6u,
+        [io_close](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            psprecomp::AllegrexContext scratch = ctx;
+            io_close(rt, scratch);
+            async_io_results[static_cast<std::int32_t>(ctx.gpr[4])] = sign_extended_result(scratch.gpr[2]);
+            ctx.set_gpr(2, 0u);
+        });
+    // sceIoWaitAsync(fd, result*) and sceIoPollAsync(fd, result*): the
+    // operation is already done, so both hand over its result and clear it.
+    const auto collect = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+        const auto found = async_io_results.find(static_cast<std::int32_t>(ctx.gpr[4]));
+        if (found == async_io_results.end()) {
+            ctx.set_gpr(2, kErrorNoAsync);
+            return;
+        }
+        store_guest64(rt, ctx.gpr[5], found->second);
+        async_io_results.erase(found);
+        ctx.set_gpr(2, 0u);
+    };
+    runtime.register_hle("IoFileMgrForUser", 0xE23EEC33u, collect);
+    runtime.register_hle("IoFileMgrForUser", 0x3251EA56u, collect);
+    // sceIoCancel(fd): nothing is ever in flight.
+    runtime.register_hle("IoFileMgrForUser", 0xE8BC6571u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            async_io_results.erase(static_cast<std::int32_t>(ctx.gpr[4]));
+            ctx.set_gpr(2, 0u);
+        });
+
+    // sceIoWrite(fd, data, size): stdout/stderr go to the log.
+    runtime.register_hle("IoFileMgrForUser", 0x42EC03ACu,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
+            const std::uint32_t data = ctx.gpr[5];
+            const std::uint32_t size = ctx.gpr[6];
+            if (size != 0u && !rt.memory().contains(data, size)) { ctx.set_gpr(2, 0x800200D3u); return; }
+            if (fd == 1 || fd == 2) {
+                std::string text(size, '\0');
+                if (size != 0u)
+                    rt.memory().copy_out(data, std::span<std::uint8_t>(
+                        reinterpret_cast<std::uint8_t *>(text.data()), text.size()));
+                std::cerr << "[guest] " << text;
+                ctx.set_gpr(2, size);
+                return;
+            }
+            const auto file = file_table.files.find(fd);
+            if (file == file_table.files.end()) { ctx.set_gpr(2, kErrorBadFile); return; }
+            std::vector<char> bytes(size);
+            if (size != 0u)
+                rt.memory().copy_out(data, std::span<std::uint8_t>(
+                    reinterpret_cast<std::uint8_t *>(bytes.data()), bytes.size()));
+            file->second.clear();
+            file->second.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            file->second.flush();
+            ctx.set_gpr(2, file->second ? size : kErrorBadFile);
+        });
+    // sceIoMkdir(path, mode)
+    runtime.register_hle("IoFileMgrForUser", 0x06A70004u,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            std::error_code error;
+            const auto native = rt.translate_path(rt.memory().read_c_string(ctx.gpr[4]));
+            const bool existed = std::filesystem::is_directory(native, error);
+            std::filesystem::create_directories(native, error);
+            ctx.set_gpr(2, existed ? 0x80010011u : (error ? 0x80010002u : 0u));
+        });
+    // sceIoRename(old, new)
+    runtime.register_hle("IoFileMgrForUser", 0x779103A0u,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            std::error_code error;
+            std::filesystem::rename(rt.translate_path(rt.memory().read_c_string(ctx.gpr[4])),
+                                    rt.translate_path(rt.memory().read_c_string(ctx.gpr[5])), error);
+            ctx.set_gpr(2, error ? 0x80010002u : 0u);
+        });
+}
+
+// The PSP message dialog, without a UI: it opens, is acknowledged with "yes"
+// on its first update, and closes. The text goes to the log.
+struct MessageDialogState {
+    std::uint32_t status{};      // 0 none, 2 visible, 3 quitting, 4 finished
+    std::uint32_t parameters{};
+};
+MessageDialogState message_dialog;
+
+// System services LCS imports and VCS never did. Its wifi multiplayer is
+// answered with "no network", which the game handles by leaving the mode
+// unavailable; the rest are small kernel/utility queries.
+void register_lcs_system_extras(psprecomp::Runtime &runtime) {
+    const auto network_unavailable = [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+        ctx.set_gpr(2, 0x80410001u);
+    };
+    for (const std::uint32_t nid : {0x0BF0A3AEu, 0x281928A9u, 0x39AF39A6u, 0x89360950u})
+        runtime.register_hle("sceNet", nid, network_unavailable);
+    for (const std::uint32_t nid : {0x157E6225u, 0x4DA4C788u, 0x6F92741Bu, 0x7F27BB5Eu, 0x877F6D66u,
+                                    0x8BEA2B3Eu, 0x9AC2EEACu, 0x9DF81198u, 0xA62C6F57u, 0xABED3790u,
+                                    0xDFE53E03u, 0xE08BDAC1u, 0xE1D621D7u, 0xFC6FC07Bu})
+        runtime.register_hle("sceNetAdhoc", nid, network_unavailable);
+    for (const std::uint32_t nid : {0x2A2A1E07u, 0x32B156B3u, 0x5E3D4B79u, 0x7945ECDAu, 0x93EF3843u,
+                                    0xB58E61B7u, 0xCA5EDA6Fu, 0xEA3C6108u, 0xF16EAF4Fu})
+        runtime.register_hle("sceNetAdhocMatching", nid, network_unavailable);
+    for (const std::uint32_t nid : {0x08FFF7A0u, 0x0AD043EDu, 0x20B317A0u, 0x34401D65u, 0x5E7F79C9u,
+                                    0x81AEE1BEu, 0x8916C003u, 0x9D689E13u, 0xE26F226Eu, 0xEC0635C1u})
+        runtime.register_hle("sceNetAdhocctl", nid, network_unavailable);
+    const auto succeed = [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 0u); };
+    runtime.register_hle("sceUtility", 0x1579A159u, succeed);   // sceUtilityLoadNetModule
+    runtime.register_hle("sceUtility", 0x64D50C56u, succeed);   // sceUtilityUnloadNetModule
+
+    // sceKernelExitGame, sceKernelSelfStopUnloadModule
+    runtime.register_hle("LoadExecForUser", 0x05572A5Fu,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            ctx.set_gpr(2, 0u);
+            rt.stop("The game exited");
+        });
+    runtime.register_hle("ModuleMgrForUser", 0xD675EBB8u,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            ctx.set_gpr(2, 0u);
+            rt.stop("The game unloaded itself");
+        });
+    // sceKernelGetModuleIdByAddress, sceKernelGetModuleId: the one module.
+    const auto module_id = [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 0x1000u); };
+    runtime.register_hle("ModuleMgrForUser", 0xD8B73127u, module_id);
+    runtime.register_hle("ModuleMgrForUser", 0xF0A26395u, module_id);
+
+    // sceKernelStdin/Stdout/Stderr
+    runtime.register_hle("StdioForUser", 0x172D316Eu,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 0u); });
+    runtime.register_hle("StdioForUser", 0xA6BAB2E9u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 1u); });
+    runtime.register_hle("StdioForUser", 0xF78BA90Au,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 2u); });
+    runtime.register_hle("SysMemUserForUser", 0x13A5ABEFu, succeed);   // sceKernelPrintf
+
+    // sceKernelLibcTime(time_t*), sceKernelLibcGettimeofday(tv*, tz*), sceKernelLibcClock()
+    runtime.register_hle("UtilsForUser", 0x27CC57F0u,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto seconds = static_cast<std::uint32_t>(std::time(nullptr));
+            if (ctx.gpr[4] != 0u && rt.memory().contains(ctx.gpr[4], 4u)) rt.memory().store32(ctx.gpr[4], seconds);
+            ctx.set_gpr(2, seconds);
+        });
+    runtime.register_hle("UtilsForUser", 0x71EC4271u,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const auto now = std::chrono::system_clock::now().time_since_epoch();
+            const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+            if (ctx.gpr[4] != 0u && rt.memory().contains(ctx.gpr[4], 8u)) {
+                rt.memory().store32(ctx.gpr[4], static_cast<std::uint32_t>(micros / 1000000));
+                rt.memory().store32(ctx.gpr[4] + 4u, static_cast<std::uint32_t>(micros % 1000000));
+            }
+            ctx.set_gpr(2, 0u);
+        });
+    runtime.register_hle("UtilsForUser", 0x91E4F6A7u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            ctx.set_gpr(2, static_cast<std::uint32_t>(virtual_time_us));
+        });
+
+    // sceDisplayGetCurrentHcount
+    runtime.register_hle("sceDisplay", 0x773DD3A3u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            ctx.set_gpr(2, static_cast<std::uint32_t>((virtual_time_us * 286u) / 16683u));
+        });
+    // scePower clock query, as float: the PSP's 333 MHz.
+    runtime.register_hle("scePower", 0xEA382A27u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            ctx.fpr[0] = 333.0f;
+            ctx.set_gpr(2, 333u);
+        });
+    // sceUmdGetErrorStat, sceUmdWaitDriveStatWithTimer: the drive is always ready.
+    runtime.register_hle("sceUmdUser", 0x20628E6Fu, succeed);
+    runtime.register_hle("sceUmdUser", 0x56202973u, succeed);
+
+    // sceUtilityGetSystemParamString(id, buffer, length): the nickname.
+    runtime.register_hle("sceUtility", 0x34B78343u,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            constexpr char kNickname[] = "Player";
+            const std::uint32_t buffer = ctx.gpr[5];
+            const std::uint32_t length = ctx.gpr[6];
+            if (length == 0u || !rt.memory().contains(buffer, length)) { ctx.set_gpr(2, 0x80110103u); return; }
+            const std::size_t count = std::min<std::size_t>(sizeof(kNickname), length);
+            for (std::size_t i = 0; i + 1u < count; ++i)
+                rt.memory().store8(buffer + static_cast<std::uint32_t>(i), static_cast<std::uint8_t>(kNickname[i]));
+            rt.memory().store8(buffer + static_cast<std::uint32_t>(count - 1u), 0u);
+            ctx.set_gpr(2, 0u);
+        });
+    // sceUtilityGetSystemParamInt(id, int*): English, cross confirms, 24 h clock.
+    runtime.register_hle("sceUtility", 0xA5DA2406u,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            std::uint32_t value = 0u;
+            switch (ctx.gpr[4]) {
+            case 8u: value = 1u; break;   // language: English
+            case 9u: value = 1u; break;   // confirm button: cross
+            default: value = 0u; break;   // channels, formats, time zone, power save
+            }
+            if (!rt.memory().contains(ctx.gpr[5], 4u)) { ctx.set_gpr(2, 0x80110103u); return; }
+            rt.memory().store32(ctx.gpr[5], value);
+            ctx.set_gpr(2, 0u);
+        });
+
+    // sceUtilityMsgDialogInitStart / ShutdownStart / Update / GetStatus
+    runtime.register_hle("sceUtility", 0x2AD8E239u,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            constexpr std::uint32_t kMessageOffset = 0x3Cu;
+            if (message_dialog.status != 0u) { ctx.set_gpr(2, 0x80110001u); return; }
+            message_dialog = MessageDialogState{2u, ctx.gpr[4]};
+            if (rt.memory().contains(ctx.gpr[4] + kMessageOffset, 512u))
+                std::cerr << "[msgdialog] " << rt.memory().read_c_string(ctx.gpr[4] + kMessageOffset, 512u) << "\n";
+            ctx.set_gpr(2, 0u);
+        });
+    runtime.register_hle("sceUtility", 0x95FC253Bu,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            constexpr std::uint32_t kCommonResultOffset = 0x1Cu;
+            constexpr std::uint32_t kButtonPressedOffset = 0x240u;
+            if (message_dialog.status == 2u) {
+                const std::uint32_t parameters = message_dialog.parameters;
+                if (rt.memory().contains(parameters + kButtonPressedOffset, 4u)) {
+                    rt.memory().store32(parameters + kCommonResultOffset, 0u);
+                    rt.memory().store32(parameters + kButtonPressedOffset, 1u);   // "yes"
+                }
+                message_dialog.status = 3u;
+            }
+            ctx.set_gpr(2, 0u);
+        });
+    runtime.register_hle("sceUtility", 0x67AF3428u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            if (message_dialog.status == 3u || message_dialog.status == 2u) message_dialog.status = 4u;
+            ctx.set_gpr(2, 0u);
+        });
+    runtime.register_hle("sceUtility", 0x9A1C91D7u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            const std::uint32_t status = message_dialog.status;
+            // Finished is reported once, then the dialog is gone.
+            if (status == 4u) message_dialog = MessageDialogState{};
+            ctx.set_gpr(2, status);
+        });
+}
+} // namespace
+
 void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start) {
-    install_native_fast_paths(runtime);
-    if (configured_game_frame_rate() > 30u) {
+    // Native leaves and the frame-limiter patch sit at VCS addresses.
+    if (!kTitleLcs) install_native_fast_paths(runtime);
+    if (!kTitleLcs && configured_game_frame_rate() > 30u) {
         runtime.register_function(kGuestFrameLimiterBranch,
                                   &unlocked_frame_limiter_patch,
                                   "vcs_unlocked_frame_limiter");
@@ -6033,6 +6327,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     std::cerr << "[frame-rate] target=" << configured_game_frame_rate()
               << " virtual_display=" << virtual_display_refresh_hz() << " Hz\n";
     file_table = FileTable{};
+    async_io_results.clear();
+    message_dialog = MessageDialogState{};
     for (auto &[address, state] : mpeg_contexts) close_video_decoder(state);
     mpeg_contexts.clear();
     for (auto &state : atrac_contexts) close_atrac_decoder(state);
@@ -6134,11 +6430,14 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     psprecomp::set_runtime_thread_identity(0, "module_start");
     runtime.register_function(0x00000000u, &vcs_module_thread_return, "psp_thread_return");
     runtime.register_function(0x00000004u, &vcs_interrupt_return, "psp_interrupt_return");
-    runtime.register_function(0x08B562D8u, &vcs_sprintf, "vcs_sprintf");
-    runtime.register_function(0x088B4FA8u, &vcs_path_hash, "vcs_path_hash");
-    runtime.register_function(0x08B1B36Cu, &vcs_load_codec_modules, "vcs_load_codec_modules");
-    if (std::getenv("PSPRECOMP_NO_FAST_DEFLATE") == nullptr)
-        runtime.register_function(0x08B648B0u, &vcs_raw_deflate_fast, "vcs_raw_deflate_fast");
+    // Host replacements of VCS guest functions, by their VCS addresses.
+    if (!kTitleLcs) {
+        runtime.register_function(0x08B562D8u, &vcs_sprintf, "vcs_sprintf");
+        runtime.register_function(0x088B4FA8u, &vcs_path_hash, "vcs_path_hash");
+        runtime.register_function(0x08B1B36Cu, &vcs_load_codec_modules, "vcs_load_codec_modules");
+        if (std::getenv("PSPRECOMP_NO_FAST_DEFLATE") == nullptr)
+            runtime.register_function(0x08B648B0u, &vcs_raw_deflate_fast, "vcs_raw_deflate_fast");
+    }
     runtime.register_hle("SysMemUserForUser", 0x7591C7DBu,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             compiled_sdk_version = ctx.gpr[4];
@@ -10008,8 +10307,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             set_success(ctx);
         });
-    runtime.register_hle("IoFileMgrForUser", 0x109F50BCu,
-        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+    // Open, seek, close and read are named so the asynchronous variants LCS
+    // uses (register_async_and_extra_io) run exactly the same code.
+    const auto io_open = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             const std::string path = rt.memory().read_c_string(ctx.gpr[4]);
             const auto native = rt.translate_path(path);
             std::ios::openmode mode = std::ios::binary;
@@ -10105,10 +10405,10 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                           << "\" flags=" << psprecomp::hex32(flags) << "\n";
             }
             ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
-        });
+        };
+    runtime.register_hle("IoFileMgrForUser", 0x109F50BCu, io_open);
 
-    runtime.register_hle("IoFileMgrForUser", 0x27EB27B8u,
-        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+    const auto io_lseek = [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint64_t raw_offset = static_cast<std::uint64_t>(ctx.gpr[6]) |
                 (static_cast<std::uint64_t>(ctx.gpr[7]) << 32u);
@@ -10170,7 +10470,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 std::cerr << "[io] sceIoLseek fd=" << fd << " offset=" << offset
                           << " whence=" << whence << " -> " << position << "\n";
             }
-        });
+        };
+    runtime.register_hle("IoFileMgrForUser", 0x27EB27B8u, io_lseek);
 
     runtime.register_hle("IoFileMgrForUser", 0x68963324u,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
@@ -10215,8 +10516,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ctx.set_gpr(2, static_cast<std::uint32_t>(position));
         });
 
-    runtime.register_hle("IoFileMgrForUser", 0x810C4BC3u,
-        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+    const auto io_close = [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const bool closed = file_table.files.erase(fd) == 1u ||
                 file_table.synthetic_empty_files.erase(fd) == 1u ||
@@ -10224,10 +10524,14 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (std::getenv("PSPRECOMP_FILE_OBJECT_DIAG") != nullptr)
                 std::cerr << "[fileobj-hle] close fd=" << fd << " closed=" << closed << "\n";
             ctx.set_gpr(2, closed ? 0u : 0x80010009u);
-        });
+        };
+    runtime.register_hle("IoFileMgrForUser", 0x810C4BC3u, io_close);
 
-    runtime.register_hle("IoFileMgrForUser", 0x6A638D83u,
-        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+    // allow_handoff: the synchronous read may yield to the woken UMD worker
+    // (defer_current_thread_for_io_handoff); an asynchronous one runs on a
+    // scratch context and must leave the scheduler alone.
+    const auto io_read = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx,
+                            bool allow_handoff) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             const std::uint32_t dst = ctx.gpr[5];
             const std::uint32_t size = ctx.gpr[6];
@@ -10239,7 +10543,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 }
                 std::uint32_t stream_request = 0u;
                 std::uint32_t release_pc_hint = 0u;
-                if (thread_table.current_uid == 5 &&
+                // VCS's UMD streaming thread and its request layout.
+                if (!kTitleLcs && thread_table.current_uid == 5 &&
                     rt.memory().contains(ctx.gpr[22] + 6916u, 4u)) {
                     stream_request = rt.memory().load32(ctx.gpr[22] + 6916u);
                     release_pc_hint = uncommitted_world_stream_release_pc(rt, stream_request);
@@ -10291,11 +10596,11 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 // Defer the worker until that exact translated return dispatch completes.
                 // This is independent of the optional execution-driven virtual clock, so
                 // PSPRECOMP_TIME_TICK_DISPATCHES=0 cannot strand the worker forever.
-                if (read != 0u) {
+                if (read != 0u && allow_handoff) {
                     (void)defer_current_thread_for_io_handoff(
                         rt, ctx, static_cast<std::uint32_t>(read), release_pc_hint);
                 } else {
-                    ctx.set_gpr(2, 0u);
+                    ctx.set_gpr(2, static_cast<std::uint32_t>(read));
                 }
                 return;
             }
@@ -10321,7 +10626,11 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const auto read = static_cast<std::size_t>(it->second.gcount());
             if (time_io) io_host_time_this_vblank += std::chrono::steady_clock::now() - io_entry;
             ctx.set_gpr(2, static_cast<std::uint32_t>(read));
-        });
+        };
+    runtime.register_hle("IoFileMgrForUser", 0x6A638D83u,
+        [io_read](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) { io_read(rt, ctx, true); });
+    register_async_and_extra_io(runtime, io_open, io_read, io_lseek, io_close);
+    register_lcs_system_extras(runtime);
 }
 
 

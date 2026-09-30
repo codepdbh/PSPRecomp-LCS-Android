@@ -33,7 +33,19 @@ if(NOT PSPRECOMP_HOT_GENERATED_INLINE_LEVEL MATCHES "^[0-3]$")
     message(FATAL_ERROR "PSPRECOMP_HOT_GENERATED_INLINE_LEVEL must be 0, 1, 2 or 3")
 endif()
 
-file(GLOB VCS_GENERATED CONFIGURE_DEPENDS "${VCS_PROFILE_DIR}/generated/*.cpp")
+# Which recompiled game the runtime links. LCS runs on this same host code: the
+# two titles share the engine, and its AOT corpus lives in profiles/lcs. The
+# host side keys its VCS-address patches off PSPRECOMP_TITLE_LCS.
+set(PSPRECOMP_GUEST_TITLE "vcs" CACHE STRING "Recompiled game to link: vcs or lcs")
+set_property(CACHE PSPRECOMP_GUEST_TITLE PROPERTY STRINGS vcs lcs)
+if(PSPRECOMP_GUEST_TITLE STREQUAL "lcs")
+    set(VCS_GENERATED_DIR "${VCS_PROFILE_DIR}/../lcs/generated")
+elseif(PSPRECOMP_GUEST_TITLE STREQUAL "vcs")
+    set(VCS_GENERATED_DIR "${VCS_PROFILE_DIR}/generated")
+else()
+    message(FATAL_ERROR "PSPRECOMP_GUEST_TITLE must be vcs or lcs")
+endif()
+file(GLOB VCS_GENERATED CONFIGURE_DEPENDS "${VCS_GENERATED_DIR}/*.cpp")
 if(MSVC)
     if(PSPRECOMP_GENERATED_OPT_LEVEL STREQUAL "0")
         set(VCS_GENERATED_MSVC_OPT "/Od")
@@ -177,10 +189,13 @@ if(ANDROID)
     )
     target_include_directories(vcs_guest_core PRIVATE
         "${VCS_PROFILE_DIR}/host"
-        "${VCS_PROFILE_DIR}/generated"
+        "${VCS_GENERATED_DIR}"
         "${VCS_PROFILE_DIR}/third_party/ffmpeg/include"
         "${VCS_PROFILE_DIR}/third_party/at3_standalone"
     )
+    if(PSPRECOMP_GUEST_TITLE STREQUAL "lcs")
+        target_compile_definitions(vcs_guest_core PRIVATE PSPRECOMP_TITLE_LCS=1)
+    endif()
     # ATRAC3/ATRAC3+ decoding for the media HLE (vcs_media_decoder_android.cpp):
     # PPSSPP's standalone extraction of FFmpeg's decoders, LGPL 2.1+. The
     # desktop build gets the same codecs from its FFmpeg libraries instead.

@@ -16,3 +16,6 @@ target_include_directories(vcs_android PRIVATE
     "${PSPRECOMP_REPO_DIR}/include"
     "${PSPRECOMP_REPO_DIR}/profiles/vcs/host")
 target_link_libraries(vcs_android PRIVATE vcs_guest_core psprecomp_core android log)
+if(PSPRECOMP_GUEST_TITLE STREQUAL "lcs")
+    target_compile_definitions(vcs_android PRIVATE PSPRECOMP_TITLE_LCS=1)
+endif()

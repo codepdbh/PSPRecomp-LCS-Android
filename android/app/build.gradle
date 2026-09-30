@@ -34,6 +34,32 @@ android {
         }
     }
 
+    buildFeatures {
+        buildConfig true
+    }
+
+    // One app per game, installable side by side. LCS runs on the VCS host
+    // code with its own recompiled corpus (profiles/lcs/generated) and reads
+    // its data from Internal storage/LCS. Build with assembleVcsDebug or
+    // assembleLcsDebug.
+    flavorDimensions "game"
+    productFlavors {
+        vcs {
+            dimension "game"
+            applicationId "com.psprecomp.vcs"
+            manifestPlaceholders = [appLabel: "VCS Android"]
+            buildConfigField "String", "GAME_FOLDER", "\"VCS\""
+            externalNativeBuild { cmake { arguments "-DPSPRECOMP_GUEST_TITLE=vcs" } }
+        }
+        lcs {
+            dimension "game"
+            applicationId "com.psprecomp.lcs"
+            manifestPlaceholders = [appLabel: "LCS Android"]
+            buildConfigField "String", "GAME_FOLDER", "\"LCS\""
+            externalNativeBuild { cmake { arguments "-DPSPRECOMP_GUEST_TITLE=lcs" } }
+        }
+    }
+
     ndkVersion "28.2.13676358"
 
     externalNativeBuild {

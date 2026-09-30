@@ -94,21 +94,35 @@ void run_game(std::filesystem::path root, std::filesystem::path app_data) {
     try {
         const std::filesystem::path elf_path =
             root / "PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF";
+#if defined(PSPRECOMP_TITLE_LCS)
+        constexpr char kFolder[] = "LCS";
+        constexpr char kTitle[] = "Grand Theft Auto: Liberty City Stories";
+        // One file from each part of the disc layout, as a completeness check.
+        const std::filesystem::path required[] = {
+            root / "PSP_GAME/USRDIR/ENTRIES.DAT", root / "PSP_GAME/USRDIR/DATA"};
+#else
+        constexpr char kFolder[] = "VCS";
+        constexpr char kTitle[] = "Grand Theft Auto: Vice City Stories";
+        const std::filesystem::path required[] = {
+            root / "PSP_GAME/USRDIR/RUNDATA/PSP/MOVIES/LOGO.PMF",
+            root / "PSP_GAME/USRDIR/RUNDATA/PSP/MOVIES/TITLES.PMF"};
+#endif
         if (!std::filesystem::is_regular_file(elf_path)) {
-            set_status("No encuentro EBOOT_DECRYPTED.ELF en Memoria interna/VCS/PSP_GAME/SYSDIR.");
+            set_status(std::string("No encuentro EBOOT_DECRYPTED.ELF en Memoria interna/") + kFolder +
+                       "/PSP_GAME/SYSDIR.");
             g_game_started.store(false, std::memory_order_release);
             return;
         }
-        if (!std::filesystem::is_regular_file(
-                root / "PSP_GAME/USRDIR/RUNDATA/PSP/MOVIES/LOGO.PMF") ||
-            !std::filesystem::is_regular_file(
-                root / "PSP_GAME/USRDIR/RUNDATA/PSP/MOVIES/TITLES.PMF")) {
-            set_status("La carpeta VCS está incompleta: faltan vídeos del juego.");
-            g_game_started.store(false, std::memory_order_release);
-            return;
+        for (const auto &path : required) {
+            if (!std::filesystem::exists(path)) {
+                set_status(std::string("La carpeta ") + kFolder + " está incompleta: falta " +
+                           path.filename().string() + ".");
+                g_game_started.store(false, std::memory_order_release);
+                return;
+            }
         }
 
-        set_status("Cargando Grand Theft Auto: Vice City Stories…");
+        set_status(std::string("Cargando ") + kTitle + "…");
         vcs::initialize_vcs_configuration(app_data);
         const vcs::VcsConfiguration &configuration = vcs::vcs_configuration();
         vcs::runtime_log_initialize(configuration);

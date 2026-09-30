@@ -1,5 +1,6 @@
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
+#include "guest_title.hpp"
 #include "vcs_config.hpp"
 #include "vcs_project2dfx.hpp"
 #include "vcs_fps_overlay.hpp"
@@ -4871,7 +4872,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         // it in horizontally like the rest of the HUD. Gameplay frames only:
         // menus share this target and have their own bottom-left items.
         // Depth-tested draws included: the frame and markers of the radar are.
-        if (hud.gameplay_world && !setup.clear_mode) {
+        // The coordinates are VCS's HUD layout; LCS keeps its radar where it is.
+        if (!kTitleLcs && hud.gameplay_world && !setup.clear_mode) {
             float min_y = vertices.front().y;
             for (const Vertex &vertex : vertices) min_y = std::min(min_y, vertex.y);
             // The map tiles overhang the radar and are cut to it by the

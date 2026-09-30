@@ -228,7 +228,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
             if (!permissionPrompted) {
                 permissionPrompted = true;
-                statusView.setText("Permite acceso a archivos para leer el juego en Memoria interna/VCS.");
+                statusView.setText("Permite acceso a archivos para leer el juego en Memoria interna/" + BuildConfig.GAME_FOLDER + ".");
                 try {
                     startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
                         Uri.parse("package:" + getPackageName())));
@@ -238,10 +238,11 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             }
             return;
         }
-        File gameRoot = new File(Environment.getExternalStorageDirectory(), "VCS");
+        // VCS/ or LCS/, per build flavor: the two games install side by side.
+        File gameRoot = new File(Environment.getExternalStorageDirectory(), BuildConfig.GAME_FOLDER);
         File elf = new File(gameRoot, "PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF");
         if (!elf.isFile()) {
-            statusView.setText("No encuentro el juego en Memoria interna/VCS/PSP_GAME.");
+            statusView.setText("No encuentro el juego en Memoria interna/" + BuildConfig.GAME_FOLDER + "/PSP_GAME.");
             return;
         }
         startRequested = true;

@@ -1056,7 +1056,10 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         if (target_is_import) {
                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
                                  << "    return;\n";
-                            continue;
+                            // End the block: `continue` re-entered the walk at
+                            // the same pc and spun forever on a direct JAL to an
+                            // import stub (LCS has them; VCS does not).
+                            break;
                         }
                         // Otherwise run the callee inline and resume locally only
                         // if it came back to our return address.

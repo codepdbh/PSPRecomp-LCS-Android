@@ -164,8 +164,9 @@ def main() -> int:
             print(json.dumps({"title": sfo.get("TITLE", ""), "disc_id": disc_id,
                               "compatible": disc_id.replace("-", "").upper() == "ULUS10160"}))
             return 0
-        if disc_id.replace("-", "").upper() != "ULUS10160":
-            parser.error(f"Unsupported DISC_ID {disc_id!r}; expected ULUS10160")
+        # VCS (ULUS10160) and LCS (ULUS10041), which runs on the same host.
+        if disc_id.replace("-", "").upper() not in ("ULUS10160", "ULUS10041"):
+            parser.error(f"Unsupported DISC_ID {disc_id!r}; expected ULUS10160 or ULUS10041")
         extract_tree(image, game_extent, game_length, destination / "PSP_GAME", image_size)
         try:
             _, umd_extent, umd_length = find_path(

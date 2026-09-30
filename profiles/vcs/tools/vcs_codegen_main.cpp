@@ -24,6 +24,11 @@
 #include <vector>
 
 namespace {
+// The verified lowerings below are keyed to addresses in the VCS executable.
+// --generic turns them off so the same single-copy emitter can translate
+// another title (LCS) without landing VCS patches in unrelated code.
+bool g_vcs_address_patches = true;
+
 struct Function {
     std::string name;
     std::uint32_t address{};
@@ -836,9 +841,18 @@ std::string generated_unit_cpp_entry_name(std::uint32_t unit) {
     return generated_unit_cpp_name(unit) + "_entry";
 }
 
+// Buckets that actually get a translation unit. A fixed edge the analyzer found
+// in data mistaken for code can point past the end of the executable, where no
+// unit exists; chaining to it directly would reference an undefined function.
+std::set<std::uint32_t> g_emitted_units;
+
 std::string direct_unit_chain_expression(
     std::uint32_t unit, std::uint32_t target,
     const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids) {
+    if (!g_emitted_units.empty() && !g_emitted_units.contains(unit)) {
+        // Through the dispatcher, which reports the address if it is ever reached.
+        return "(ctx.pc = " + psprecomp::hex32(target) + "u, rt.invoke_chained_call(ctx, &aot_mem))";
+    }
     if (direct_entry_ids != nullptr) {
         const auto found = direct_entry_ids->find(target);
         if (found != direct_entry_ids->end() && found->second != 0u) {
@@ -984,7 +998,13 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
     for (const auto block_start : function.entry_labels) {
         body << "L_" << psprecomp::hex32(block_start).substr(2) << ":\n";
         std::uint32_t pc = block_start;
+        std::uint64_t block_steps = 0u;
         while (function.instructions.contains(pc)) {
+            // A block walk that never advances is a generator bug, not slow code:
+            // report where it spins instead of hanging the whole corpus.
+            if (++block_steps > 200000u)
+                throw psprecomp::Error("emit loop stuck in block " + psprecomp::hex32(block_start) +
+                                       " at " + psprecomp::hex32(pc));
             if (pc != block_start && function.entry_labels.contains(pc)) {
                 body << "    goto L_" << psprecomp::hex32(pc).substr(2) << ";\n";
                 break;
@@ -994,7 +1014,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
             // 0x08B64AD8 performs a forward LZ back-reference copy one byte at
             // a time. Preserve its register/error semantics while lowering the
             // copy itself to GuestMemory's overlap-aware bulk operation.
-            if (pc == 0x08B64AD8u) {
+            if (g_vcs_address_patches && pc == 0x08B64AD8u) {
                 body << "    ctx.set_gpr(10, ctx.gpr[14] < ctx.gpr[20] ? 1u : 0u);\n"
                      << "    if (ctx.gpr[10] == 0u) {\n"
                      << "        ctx.set_gpr(4, ctx.gpr[4] + static_cast<std::uint32_t>(1));\n"
@@ -1019,7 +1039,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
             // moving away and accepts continued penetration.  Reorient only
             // steep ped-vs-building contacts that agree with downward motion;
             // wall contacts and upward ceiling impacts remain untouched.
-            if (pc == 0x08931438u) {
+            if (g_vcs_address_patches && pc == 0x08931438u) {
                 body << "    if (ctx.gpr[2] != 0u &&\n"
                      << "        (rt.memory().aot_load32(ctx.gpr[16] + 72u) & 14u) == 6u &&\n"
                      << "        (rt.memory().aot_load32(ctx.gpr[18] + 72u) & 14u) == 2u) {\n"
@@ -1083,14 +1103,14 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                     body << emit_regular(slot, pc + 4u);
                     if (decoded.kind == psprecomp::OpcodeKind::J) {
                         emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
-                    } else if (target == 0x08B648B0u) {
+                    } else if (g_vcs_address_patches && target == 0x08B648B0u) {
                         // Keep the VCS raw-DEFLATE entry visible to Runtime so
                         // install_profile can select the verified host decoder.
                         // With PSPRECOMP_NO_FAST_DEFLATE the same dispatch lands
                         // in the original generated guest implementation.
                         body << "    ctx.pc = 0x08B648B0u;\n"
                              << "    return;\n";
-                    } else if (target == 0x088B1554u) {
+                    } else if (g_vcs_address_patches && target == 0x088B1554u) {
                         const std::uint32_t return_pc = pc + 8u;
                         body << "    ctx.pc = 0x088B1554u;\n"
                              << "    rt.invoke_native_fast_path(0x088B1554u, ctx);\n"
@@ -1108,7 +1128,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         // re-decodes a dense entry id and burns the local-transfer
                         // counter. The delay slot and $ra write have already run.
                         body << "    goto L_" << psprecomp::hex32(target).substr(2) << ";\n";
-                    } else if (target == 0x088B1780u) {
+                    } else if (g_vcs_address_patches && target == 0x088B1780u) {
                         const std::uint32_t return_pc = pc + 8u;
                         body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
                              << "    rt.invoke_native_fast_path(0x088B1780u, ctx);\n"
@@ -1130,7 +1150,10 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         if (target_is_import) {
                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
                                  << "    return;\n";
-                            continue;
+                            // The block ends here. `continue` re-entered the
+                            // block walk at the same pc and spun forever: VCS
+                            // never JALs an import stub directly, LCS does.
+                            break;
                         }
                         // Otherwise run the callee inline and resume locally only
                         // if it came back to our return address.
@@ -1163,7 +1186,8 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         body << "    ctx.set_gpr(" << link << ", " << psprecomp::hex32(pc + 8u) << "u);\n";
                     }
                     body << emit_regular(slot, pc + 4u);
-                    if (decoded.kind == psprecomp::OpcodeKind::Jalr && pc == 0x0886269Cu) {
+                    if (g_vcs_address_patches && decoded.kind == psprecomp::OpcodeKind::Jalr &&
+                        pc == 0x0886269Cu) {
                         const std::uint32_t return_pc = pc + 8u;
                         body << "    ctx.pc = jump_target;\n"
                              << "    rt.invoke_native_fast_path(0x088B1780u, ctx);\n"
@@ -1581,6 +1605,7 @@ int generate_auto(const std::filesystem::path &elf_path,
     for (const auto &unit : units) {
         std::uint16_t id = 1u;
         for (const auto label : unit.entries) direct_entry_ids[label] = id++;
+        g_emitted_units.insert(unit.bucket);
     }
 
     // External declarations let fixed cross-unit edges become native direct
@@ -1712,6 +1737,14 @@ int generate_auto(const std::filesystem::path &elf_path,
 } // namespace
 
 int main(int argc, char **argv) {
+    // --generic may appear anywhere; strip it before the positional parsing.
+    std::vector<char *> args;
+    for (int i = 0; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--generic") g_vcs_address_patches = false;
+        else args.push_back(argv[i]);
+    }
+    argc = static_cast<int>(args.size());
+    argv = args.data();
     try {
         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
             if (argc > 6) {
