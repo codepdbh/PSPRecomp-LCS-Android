@@ -45,7 +45,28 @@ struct DrawBatch {
     std::uint64_t texture_key{};
     bool textured{};
     bool framebuffer_feedback{};
+    // Model-space vertices; the vertex shader applies `transform`.
+    bool hardware{};
+    GeGpuHardwareTransform transform{};
 };
+
+// One hardware-transformed draw's constants, std430 as the vertex shader's
+// Transform: model->clip folded with the PSP viewport into the target's NDC.
+struct GpuTransform {
+    std::array<float, 4> row0{}, row1{}, row2{}, row3{};
+    std::array<float, 4> view_z{};
+    std::array<float, 4> uv_scale_offset{};
+    std::array<float, 4> fog{};
+    std::array<std::uint32_t, 4> flags{};
+    std::array<float, 4> color_mul{};
+    std::array<float, 4> color_add{};
+};
+static_assert(sizeof(GpuTransform) == 160u, "must match the std430 Transform");
+constexpr std::uint32_t kMaxHardwareTransforms = 8192u;
+// Fragment push constants overlap the vertex range (0..95, which holds the
+// hardware-transform control at 80), so their pushes name both stages.
+constexpr VkShaderStageFlags kFragmentPushStages =
+    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
 struct Texture {
     std::uint64_t signature{};
@@ -133,6 +154,10 @@ struct VulkanPreview {
     // Five PSP blend variants, each with 34 depth/texture combinations.
     std::array<VkPipeline, 170> pipelines{};
     Buffer vertices_gpu{};
+    Buffer transforms_gpu{};
+    VkDescriptorSetLayout transform_layout{VK_NULL_HANDLE};
+    VkDescriptorPool transform_pool{VK_NULL_HANDLE};
+    VkDescriptorSet transform_set{VK_NULL_HANDLE};
     Buffer readback{};
     std::vector<GeGpuVertex> vertices;
     std::vector<DrawBatch> batches;
@@ -248,6 +273,35 @@ std::uint64_t texture_key(const GeGpuDrawDescriptor &draw) noexcept {
 }
 
 bool create_buffer(VulkanPreview &s, VkDeviceSize bytes, VkBufferUsageFlags usage,
+                   Buffer &buffer);
+
+// The descriptor set through which every draw's vertex shader reads the
+// hardware-transform constants (set 1).
+bool create_transform_set(VulkanPreview &s) {
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u};
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = 1u;
+    pool.poolSizeCount = 1u;
+    pool.pPoolSizes = &size;
+    if (vkCreateDescriptorPool(s.device, &pool, nullptr, &s.transform_pool) != VK_SUCCESS)
+        return false;
+    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocate.descriptorPool = s.transform_pool;
+    allocate.descriptorSetCount = 1u;
+    allocate.pSetLayouts = &s.transform_layout;
+    if (vkAllocateDescriptorSets(s.device, &allocate, &s.transform_set) != VK_SUCCESS)
+        return false;
+    VkDescriptorBufferInfo info{s.transforms_gpu.handle, 0u, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = s.transform_set;
+    write.descriptorCount = 1u;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &info;
+    vkUpdateDescriptorSets(s.device, 1u, &write, 0u, nullptr);
+    return true;
+}
+
+bool create_buffer(VulkanPreview &s, VkDeviceSize bytes, VkBufferUsageFlags usage,
                    Buffer &buffer) {
     VkBufferCreateInfo description{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     description.size = bytes;
@@ -271,7 +325,12 @@ void destroy_backend(VulkanPreview &s) {
     if (s.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(s.device);
         destroy_buffer(s, s.vertices_gpu);
+        destroy_buffer(s, s.transforms_gpu);
         destroy_buffer(s, s.readback);
+        if (s.transform_pool != VK_NULL_HANDLE)
+            vkDestroyDescriptorPool(s.device, s.transform_pool, nullptr);
+        if (s.transform_layout != VK_NULL_HANDLE)
+            vkDestroyDescriptorSetLayout(s.device, s.transform_layout, nullptr);
         for (auto &[key, texture] : s.textures) destroy_texture(s, texture);
         for (VkPipeline pipeline : s.pipelines)
             if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(s.device, pipeline, nullptr);
@@ -538,15 +597,30 @@ bool create_pipeline(VulkanPreview &s) {
     world_write.pImageInfo = &world_image_info;
     vkUpdateDescriptorSets(s.device, 1u, &world_write, 0u, nullptr);
 
+    VkDescriptorSetLayoutBinding transform_binding{};
+    transform_binding.binding = 0u;
+    transform_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    transform_binding.descriptorCount = 1u;
+    transform_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    VkDescriptorSetLayoutCreateInfo transform_layout{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    transform_layout.bindingCount = 1u;
+    transform_layout.pBindings = &transform_binding;
+    if (vkCreateDescriptorSetLayout(s.device, &transform_layout, nullptr,
+                                    &s.transform_layout) != VK_SUCCESS) return false;
+
+    // Vertex: scale at 0 and the hardware-transform control at 80. Two ranges
+    // may not share a stage, so the vertex range spans the fragment one.
     std::array<VkPushConstantRange, 2> push{};
     push[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    push[0].size = 4u * sizeof(float);
+    push[0].size = 24u * sizeof(float);
     push[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     push[1].offset = 4u * sizeof(float);
     push[1].size = 16u * sizeof(float);
+    const std::array<VkDescriptorSetLayout, 2> set_layouts{s.descriptor_layout, s.transform_layout};
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layout.setLayoutCount = 1u;
-    layout.pSetLayouts = &s.descriptor_layout;
+    layout.setLayoutCount = static_cast<std::uint32_t>(set_layouts.size());
+    layout.pSetLayouts = set_layouts.data();
     layout.pushConstantRangeCount = static_cast<std::uint32_t>(push.size());
     layout.pPushConstantRanges = push.data();
     if (vkCreatePipelineLayout(s.device, &layout, nullptr, &s.pipeline_layout) != VK_SUCCESS)
@@ -756,6 +830,9 @@ bool create_backend(VulkanPreview &s, std::string &error) {
                             s.world_width, s.world_height) ||
         !create_depth_image(s) || !create_pipeline(s) ||
         !create_buffer(s, kVertexCapacity, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, s.vertices_gpu) ||
+        !create_buffer(s, sizeof(GpuTransform) * kMaxHardwareTransforms,
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, s.transforms_gpu) ||
+        !create_transform_set(s) ||
         !create_buffer(s, static_cast<VkDeviceSize>(s.display_width) * s.display_height * 4u,
                        VK_BUFFER_USAGE_TRANSFER_DST_BIT, s.readback)) {
         error = "Vulkan preview resource creation failed";
@@ -1255,9 +1332,97 @@ void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
         s.batches.clear();
     }
 }
-void ge_gpu_backend_accumulate_hardware_triangles(const GeGpuDrawDescriptor &,
-    const GeGpuHardwareTransform &, std::span<const GeGpuVertex>,
-    std::span<const std::uint32_t>) noexcept {}
+// The DX12 backend's make_transform_constants, for Vulkan's Y-down NDC.
+GpuTransform make_gpu_transform(const DrawBatch &batch, std::uint32_t logical_width,
+                                std::uint32_t logical_height) noexcept {
+    const GeGpuHardwareTransform &hw = batch.transform;
+    const float width = static_cast<float>(std::max<std::uint32_t>(1u, logical_width));
+    const float height = static_cast<float>(std::max<std::uint32_t>(1u, logical_height));
+    const auto row = [&](std::size_t r) {
+        return std::array<float, 4>{hw.model_to_clip[r], hw.model_to_clip[4u + r],
+                                    hw.model_to_clip[8u + r], hw.model_to_clip[12u + r]};
+    };
+    const auto add_scaled = [](const std::array<float, 4> &a, float sa,
+                               const std::array<float, 4> &b, float sb) {
+        return std::array<float, 4>{a[0] * sa + b[0] * sb, a[1] * sa + b[1] * sb,
+                                    a[2] * sa + b[2] * sb, a[3] * sa + b[3] * sb};
+    };
+    const float x_a = hw.viewport_scale_x * (2.0f / width);
+    const float x_b = (hw.viewport_center_x - hw.viewport_offset_x) * (2.0f / width) - 1.0f;
+    const float y_a = hw.viewport_scale_y * (2.0f / height);
+    const float y_b = (hw.viewport_center_y - hw.viewport_offset_y) * (2.0f / height) - 1.0f;
+    constexpr float inv_depth = 1.0f / 65535.0f;
+    GpuTransform t{};
+    t.row0 = add_scaled(row(0u), x_a, row(3u), x_b);
+    t.row1 = add_scaled(row(1u), y_a, row(3u), y_b);
+    t.row2 = add_scaled(row(2u), hw.viewport_scale_z * inv_depth, row(3u),
+                        hw.viewport_center_z * inv_depth);
+    t.row3 = row(3u);
+    t.view_z = hw.model_to_view_z;
+    float us = hw.uv_scale_u, vs = hw.uv_scale_v, uo = hw.uv_offset_u, vo = hw.uv_offset_v;
+    if (batch.framebuffer_feedback && batch.draw.texture_width != 0u && batch.draw.texture_height != 0u) {
+        // The world image is 512x320 of the texture's normalized space.
+        const float su = static_cast<float>(batch.draw.texture_width) / static_cast<float>(kWorldWidth);
+        const float sv = static_cast<float>(batch.draw.texture_height) / static_cast<float>(kWorldHeight);
+        us *= su; uo *= su; vs *= sv; vo *= sv;
+    }
+    t.uv_scale_offset = {us, vs, uo, vo};
+    t.fog = {hw.fog_end, hw.fog_slope, 0.0f, 0.0f};
+    t.flags = {hw.depth_clip_enabled ? 1u : 0u, hw.vertex_color_affine ? 1u : 0u, 0u, 0u};
+    t.color_mul = hw.vertex_color_mul;
+    t.color_add = hw.vertex_color_add;
+    return t;
+}
+
+void ge_gpu_backend_accumulate_hardware_triangles(const GeGpuDrawDescriptor &draw,
+    const GeGpuHardwareTransform &transform, std::span<const GeGpuVertex> vertices,
+    std::span<const std::uint32_t> triangle_indices) noexcept {
+    VulkanPreview &s = state();
+    if (!s.enabled || vertices.empty()) return;
+    // The pipelines draw triangle lists: indices and strips are expanded here.
+    const bool strip = transform.primitive == 4u && triangle_indices.empty();
+    std::size_t emitted = !triangle_indices.empty() ? triangle_indices.size()
+                        : strip ? (vertices.size() > 2u ? (vertices.size() - 2u) * 3u : 0u)
+                        : vertices.size();
+    if (emitted == 0u || (emitted % 3u) != 0u) return;
+    const std::size_t max_vertices = static_cast<std::size_t>(kVertexCapacity / sizeof(GeGpuVertex));
+    if (emitted > max_vertices || s.vertices.size() > max_vertices - emitted) return;
+    try {
+        const auto first = static_cast<std::uint32_t>(s.vertices.size());
+        if (!triangle_indices.empty()) {
+            for (const std::uint32_t index : triangle_indices) {
+                if (index >= vertices.size()) { s.vertices.resize(first); return; }
+                s.vertices.push_back(vertices[index]);
+            }
+        } else if (strip) {
+            for (std::size_t i = 0u; i + 2u < vertices.size(); ++i) {
+                const bool odd = (i & 1u) != 0u;
+                s.vertices.push_back(vertices[odd ? i + 1u : i]);
+                s.vertices.push_back(vertices[odd ? i : i + 1u]);
+                s.vertices.push_back(vertices[i + 2u]);
+            }
+        } else {
+            s.vertices.insert(s.vertices.end(), vertices.begin(), vertices.end());
+        }
+        const std::uint64_t key = draw.texture_enabled ? texture_key(draw) : 0u;
+        const bool feedback = ge_gpu_backend_is_framebuffer_feedback_texture(draw);
+        const bool textured = feedback || (draw.texture_enabled && s.textures.contains(key));
+        DrawBatch batch{draw, first, static_cast<std::uint32_t>(s.vertices.size() - first),
+                        key, textured, feedback};
+        batch.hardware = true;
+        batch.transform = transform;
+        s.batches.push_back(batch);
+        if (!draw.through && !draw.clear_mode) s.frame_has_scene = true;
+        ++s.report.game_draw_calls;
+        ++s.report.hw_transform_draw_calls;
+        s.report.game_vertices += emitted;
+        s.report.hw_transform_vertices += vertices.size();
+        s.report.game_triangles += emitted / 3u;
+    } catch (...) {
+        s.vertices.clear();
+        s.batches.clear();
+    }
+}
 bool ge_gpu_backend_accumulate_hardware_packed_0115(const GeGpuDrawDescriptor &,
     const GeGpuHardwareTransform &, std::span<const std::byte>, std::uint32_t,
     std::span<const std::uint32_t>) noexcept { return false; }
@@ -1426,9 +1591,7 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
             for (const DrawBatch &batch : s.batches) {
                 if ((batch.draw.framebuffer_address & 0x001FFFF0u) != address)
                     continue;
-                output.push_back({batch.draw, batch.first, batch.count,
-                                  batch.texture_key, batch.textured,
-                                  batch.framebuffer_feedback});
+                output.push_back(batch);
             }
         };
         const bool display_has_draws = std::any_of(s.batches.begin(), s.batches.end(),
@@ -1515,6 +1678,7 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
     // Each pass maps PSP screen coordinates onto its own surface: the world at
     // 512x320, the display at 480x272. Viewport, vertex scale and scissor limits
     // all follow the pass.
+    std::uint32_t transform_count = 0u;
     const auto record_batches = [&](const std::vector<DrawBatch> &batches,
                                     std::uint32_t width, std::uint32_t height,
                                     std::uint32_t physical_width,
@@ -1526,6 +1690,9 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
         2.0f / static_cast<float>(width), 2.0f / static_cast<float>(height), -1.0f, -1.0f};
     vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
                        0u, sizeof(scale), scale.data());
+    vkCmdBindDescriptorSets(s.command, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipeline_layout,
+                            1u, 1u, &s.transform_set, 0u, nullptr);
+    std::uint32_t last_control_mode = UINT32_MAX;
     for (const DrawBatch &batch : batches) {
         // A GE clear ignores texturing, alpha test, fog, blending and the depth
         // test: it paints its colour and, if asked, resets depth. Drawn with the
@@ -1534,6 +1701,24 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
         // came out black. Depth- or alpha-only clears are left to the pass,
         // which starts cleared; the pipelines have no colour-masked variant.
         GeGpuDrawDescriptor draw = batch.draw;
+        {
+            // Hardware transform: the rows depend on this pass's logical extent,
+            // so they are built here, one slot per draw.
+            std::array<std::uint32_t, 4> control{0u, 0u, 0u, 0u};
+            if (batch.hardware && transform_count < kMaxHardwareTransforms) {
+                auto *slots = static_cast<GpuTransform *>(s.transforms_gpu.mapped);
+                slots[transform_count] = make_gpu_transform(batch, width, height);
+                control = {1u, transform_count, 0u, 0u};
+                ++transform_count;
+            } else if (batch.hardware) {
+                continue;   // out of slots this frame: drop rather than draw untransformed
+            }
+            if (control[0] != 0u || last_control_mode != 0u) {
+                vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                                   80u, sizeof(control), control.data());
+                last_control_mode = control[0];
+            }
+        }
         if (draw.clear_mode) {
             if (!draw.clear_color) continue;
             draw.texture_enabled = false;
@@ -1548,7 +1733,7 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
             draw.alpha_test_enabled ? 1u : 0u,
             draw.alpha_function, draw.alpha_reference,
             draw.alpha_mask};
-        vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+        vkCmdPushConstants(s.command, s.pipeline_layout, kFragmentPushStages,
                            48u, sizeof(alpha), alpha.data());
         const std::uint32_t fog_color = draw.fog_color;
         const std::array<float, 4> fog{
@@ -1556,7 +1741,7 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
             static_cast<float>((fog_color >> 8u) & 0xFFu) / 255.0f,
             static_cast<float>((fog_color >> 16u) & 0xFFu) / 255.0f,
             draw.fog_enabled ? 1.0f : 0.0f};
-        vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+        vkCmdPushConstants(s.command, s.pipeline_layout, kFragmentPushStages,
                            64u, sizeof(fog), fog.data());
         if (draw.fog_enabled) ++s.report.fogged_game_draw_calls;
         const auto texture = s.textures.find(batch.texture_key);
@@ -1611,9 +1796,9 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
                 static_cast<float>(env & 0xFFu) / 255.0f,
                 static_cast<float>((env >> 8u) & 0xFFu) / 255.0f,
                 static_cast<float>((env >> 16u) & 0xFFu) / 255.0f, 1.0f};
-            vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+            vkCmdPushConstants(s.command, s.pipeline_layout, kFragmentPushStages,
                                16u, sizeof(control), control.data());
-            vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+            vkCmdPushConstants(s.command, s.pipeline_layout, kFragmentPushStages,
                                32u, sizeof(environment), environment.data());
         }
         // Scissor arrives in PSP pixels; scale it onto the physical target.

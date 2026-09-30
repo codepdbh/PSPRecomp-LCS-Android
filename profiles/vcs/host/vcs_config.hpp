@@ -138,7 +138,13 @@ struct RenderingConfiguration {
     //
     // Generated/reflection UVs are supported by this path as well, keeping all
     // passes of vehicle bodywork on the same depth transform.
+#if defined(__ANDROID__)
+    // Vulkan runs it on Android: the vertex shader does projection and
+    // viewport, the CPU skips transform, clipping and triangle preparation.
+    bool hardware_transform{true};
+#else
     bool hardware_transform{false};
+#endif
     // Stage 44.6: enable the native Direct3D 12 GE path. It includes decoded
     // PSP textures, persistent framebuffer feedback, direct swapchain present,
     // depth precision selection and native MSAA/resolve.

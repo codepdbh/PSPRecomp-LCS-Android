@@ -277,7 +277,13 @@ bool packed_0115_gpu_decode_enabled() noexcept {
     // distributing it across more host threads. Keep an A/B switch for parity.
     static const bool enabled = [] {
         const char *text = std::getenv("PSPRECOMP_DX12_PACKED_0115");
+#if defined(__ANDROID__)
+        // The Vulkan backend takes decoded vertices only; building the packed
+        // submission first would be thrown away on every draw.
+        if (text == nullptr || *text == '\0') return false;
+#else
         if (text == nullptr || *text == '\0') return true;
+#endif
         return std::strcmp(text, "0") != 0 &&
                std::strcmp(text, "false") != 0 && std::strcmp(text, "FALSE") != 0 &&
                std::strcmp(text, "off") != 0 && std::strcmp(text, "OFF") != 0;
@@ -290,6 +296,10 @@ bool direct_nonindexed_gpu_draw_enabled() noexcept {
     // while the crash fix is validated on the user's physical driver.
     static const bool enabled = [] {
         const char *text = std::getenv("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW");
+#if defined(__ANDROID__)
+        // Vulkan's hardware path takes an index-free triangle list as is.
+        if (text == nullptr || *text == '\0') return true;
+#endif
         return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0 &&
                std::strcmp(text, "false") != 0 && std::strcmp(text, "FALSE") != 0 &&
                std::strcmp(text, "off") != 0 && std::strcmp(text, "OFF") != 0;
