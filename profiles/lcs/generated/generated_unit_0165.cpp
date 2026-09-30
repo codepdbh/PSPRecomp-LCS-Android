@@ -1,5 +1,6 @@
 #include "psprecomp/runtime.hpp"
 #include "generated_units.hpp"
+#include "vcs_camera_input.hpp"
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -3086,6 +3087,9 @@ L_08A98AA8:
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 648u, 0x08A96C60u>(ctx, &aot_mem) && ctx.pc == 0x08A98AB0u) goto L_08A98AB0;
     return;
 L_08A98AB0:
+    // lcs-camera-hook gun aim x: the second stick when the pad reads centred.
+    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
+        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_x())));
     ctx.fpr[12] = std::bit_cast<float>(ctx.gpr[2]);
     ctx.fpr[13] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[16] + static_cast<std::uint32_t>(184)));
     ctx.fpr[12] = static_cast<float>(static_cast<std::int32_t>(std::bit_cast<std::uint32_t>(ctx.fpr[12])));
@@ -3106,6 +3110,9 @@ L_08A98AD4:
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 648u, 0x08A96C60u>(ctx, &aot_mem) && ctx.pc == 0x08A98ADCu) goto L_08A98ADC;
     return;
 L_08A98ADC:
+    // lcs-camera-hook gun aim x: the second stick when the pad reads centred.
+    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
+        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_x())));
     { const bool branch_taken = 0u == 0u;
     // nop
       if (branch_taken) {
@@ -3119,6 +3126,9 @@ L_08A98AE4:
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 648u, 0x08A96C60u>(ctx, &aot_mem) && ctx.pc == 0x08A98AECu) goto L_08A98AEC;
     return;
 L_08A98AEC:
+    // lcs-camera-hook gun aim x: the second stick when the pad reads centred.
+    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
+        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_x())));
     ctx.gpr[4] = (2232u << 16u);
     ctx.fpr[12] = std::bit_cast<float>(ctx.gpr[2]);
     ctx.gpr[4] = (ctx.gpr[4] + static_cast<std::uint32_t>(13216));
@@ -3217,6 +3227,9 @@ L_08A98B9C:
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 652u, 0x08A96CA4u>(ctx, &aot_mem) && ctx.pc == 0x08A98BA4u) goto L_08A98BA4;
     return;
 L_08A98BA4:
+    // lcs-camera-hook gun aim y: the second stick when the pad reads centred.
+    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
+        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_y())));
     ctx.gpr[4] = (2229u << 16u);
     ctx.fpr[12] = std::bit_cast<float>(ctx.gpr[2]);
     ctx.gpr[4] = (aot_mem.aot_load8(ctx.gpr[4] + static_cast<std::uint32_t>(25651)));
@@ -3272,6 +3285,9 @@ L_08A98C04:
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 652u, 0x08A96CA4u>(ctx, &aot_mem) && ctx.pc == 0x08A98C0Cu) goto L_08A98C0C;
     return;
 L_08A98C0C:
+    // lcs-camera-hook gun aim y: the second stick when the pad reads centred.
+    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
+        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_y())));
     ctx.gpr[4] = (2229u << 16u);
     ctx.fpr[12] = std::bit_cast<float>(ctx.gpr[2]);
     ctx.gpr[4] = (aot_mem.aot_load8(ctx.gpr[4] + static_cast<std::uint32_t>(25651)));
@@ -3341,6 +3357,8 @@ L_08A98C8C:
     ctx.gpr[5] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(aot_mem.aot_load16(ctx.gpr[4] + static_cast<std::uint32_t>(0))))));
     aot_mem.aot_store32(ctx.gpr[29] + static_cast<std::uint32_t>(16), ctx.gpr[16]);
     ctx.gpr[16] = (ctx.gpr[4] | 0u);
+    // lcs-camera-hook camera x: satisfy the D-pad ramp.
+    if (vcs::vcs_camera_hook_enabled()) ctx.gpr[5] = (7u);
     ctx.gpr[4] = (static_cast<std::int32_t>(ctx.gpr[5]) < 7 ? 1u : 0u);
     aot_mem.aot_store32(ctx.gpr[29] + static_cast<std::uint32_t>(20), ctx.gpr[31]);
     { const bool branch_taken = ctx.gpr[4] != 0u;
@@ -3356,6 +3374,8 @@ L_08A98CAC:
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 1006u, 0x08A97C2Cu>(ctx, &aot_mem) && ctx.pc == 0x08A98CB4u) goto L_08A98CB4;
     return;
 L_08A98CB4:
+    // lcs-camera-hook camera x: never skip the stick read.
+    if (vcs::vcs_camera_hook_enabled()) goto L_08A98D08;
     { const bool branch_taken = ctx.gpr[2] == 0u;
     // nop
       if (branch_taken) {
@@ -3435,6 +3455,11 @@ L_08A98D20:
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 513u, 0x08A96408u>(ctx, &aot_mem) && ctx.pc == 0x08A98D28u) goto L_08A98D28;
     return;
 L_08A98D28:
+    // lcs-camera-hook camera x from the touch/mouse/pad second stick.
+    if (vcs::vcs_camera_hook_enabled()) {
+        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_x())));
+        goto L_08A98D30;
+    }
     ctx.gpr[31] = (0x08A98D30u);
     ctx.gpr[4] = (ctx.gpr[2] | 0u);
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 648u, 0x08A96C60u>(ctx, &aot_mem) && ctx.pc == 0x08A98D30u) goto L_08A98D30;
@@ -3498,6 +3523,8 @@ L_08A98D8C:
     ctx.gpr[5] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(aot_mem.aot_load16(ctx.gpr[4] + static_cast<std::uint32_t>(0))))));
     aot_mem.aot_store32(ctx.gpr[29] + static_cast<std::uint32_t>(16), ctx.gpr[16]);
     ctx.gpr[16] = (ctx.gpr[4] | 0u);
+    // lcs-camera-hook camera y: satisfy the D-pad ramp.
+    if (vcs::vcs_camera_hook_enabled()) ctx.gpr[5] = (7u);
     ctx.gpr[4] = (static_cast<std::int32_t>(ctx.gpr[5]) < 7 ? 1u : 0u);
     aot_mem.aot_store32(ctx.gpr[29] + static_cast<std::uint32_t>(20), ctx.gpr[31]);
     { const bool branch_taken = ctx.gpr[4] != 0u;
@@ -3513,6 +3540,8 @@ L_08A98DAC:
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 1006u, 0x08A97C2Cu>(ctx, &aot_mem) && ctx.pc == 0x08A98DB4u) goto L_08A98DB4;
     return;
 L_08A98DB4:
+    // lcs-camera-hook camera y: never skip the stick read.
+    if (vcs::vcs_camera_hook_enabled()) goto L_08A98DC0;
     { const bool branch_taken = ctx.gpr[2] == 0u;
     // nop
       if (branch_taken) {
@@ -3547,6 +3576,11 @@ L_08A98DD8:
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 513u, 0x08A96408u>(ctx, &aot_mem) && ctx.pc == 0x08A98DE0u) goto L_08A98DE0;
     return;
 L_08A98DE0:
+    // lcs-camera-hook camera y from the touch/mouse/pad second stick.
+    if (vcs::vcs_camera_hook_enabled()) {
+        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_y())));
+        goto L_08A98DE8;
+    }
     ctx.gpr[31] = (0x08A98DE8u);
     ctx.gpr[4] = (ctx.gpr[2] | 0u);
     if (rt.invoke_chained_direct<&recomp_unit_0164_entry, 164u, 652u, 0x08A96CA4u>(ctx, &aot_mem) && ctx.pc == 0x08A98DE8u) goto L_08A98DE8;

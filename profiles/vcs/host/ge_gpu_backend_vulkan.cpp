@@ -1526,69 +1526,86 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
     vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
                        0u, sizeof(scale), scale.data());
     for (const DrawBatch &batch : batches) {
+        // A GE clear ignores texturing, alpha test, fog, blending and the depth
+        // test: it paints its colour and, if asked, resets depth. Drawn with the
+        // state the previous draw left behind, a clear after depth-tested
+        // geometry was discarded -- LCS paints its sky with one, and the sky
+        // came out black. Depth- or alpha-only clears are left to the pass,
+        // which starts cleared; the pipelines have no colour-masked variant.
+        GeGpuDrawDescriptor draw = batch.draw;
+        if (draw.clear_mode) {
+            if (!draw.clear_color) continue;
+            draw.texture_enabled = false;
+            draw.alpha_test_enabled = false;
+            draw.fog_enabled = false;
+            draw.blend_enabled = false;
+            draw.depth_test_enabled = draw.clear_depth;
+            draw.depth_function = 1u;   // always
+            draw.depth_write_enabled = draw.clear_depth;
+        }
         const std::array<std::uint32_t, 4> alpha{
-            batch.draw.alpha_test_enabled ? 1u : 0u,
-            batch.draw.alpha_function, batch.draw.alpha_reference,
-            batch.draw.alpha_mask};
+            draw.alpha_test_enabled ? 1u : 0u,
+            draw.alpha_function, draw.alpha_reference,
+            draw.alpha_mask};
         vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            48u, sizeof(alpha), alpha.data());
-        const std::uint32_t fog_color = batch.draw.fog_color;
+        const std::uint32_t fog_color = draw.fog_color;
         const std::array<float, 4> fog{
             static_cast<float>(fog_color & 0xFFu) / 255.0f,
             static_cast<float>((fog_color >> 8u) & 0xFFu) / 255.0f,
             static_cast<float>((fog_color >> 16u) & 0xFFu) / 255.0f,
-            batch.draw.fog_enabled ? 1.0f : 0.0f};
+            draw.fog_enabled ? 1.0f : 0.0f};
         vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            64u, sizeof(fog), fog.data());
-        if (batch.draw.fog_enabled) ++s.report.fogged_game_draw_calls;
+        if (draw.fog_enabled) ++s.report.fogged_game_draw_calls;
         const auto texture = s.textures.find(batch.texture_key);
-        const bool textured = batch.framebuffer_feedback ||
+        const bool textured = !draw.clear_mode && (batch.framebuffer_feedback ||
             (batch.textured && texture != s.textures.end() &&
-             texture->second.descriptor != VK_NULL_HANDLE);
+             texture->second.descriptor != VK_NULL_HANDLE));
         // A textured draw whose image is not resident (refused or evicted since
         // it was queued) is skipped rather than drawn untextured: missing for a
         // frame is far less visible than a block of its flat vertex colour.
-        if (batch.draw.texture_enabled && !textured) {
+        if (draw.texture_enabled && !textured) {
             ++s.report.missing_texture_draw_calls;
             static unsigned logged_missing = 0u;
             if (logged_missing < 40u) {
                 ++logged_missing;
                 __android_log_print(ANDROID_LOG_INFO, "VCSVulkan",
                     "skip untextured target=%05x tex=%08x fmt=%u %ux%u bw=%u clut=%08x through=%d queued_textured=%d cached=%d",
-                    batch.draw.framebuffer_address & 0x001FFFF0u, batch.draw.texture_address,
-                    batch.draw.texture_format, batch.draw.texture_width, batch.draw.texture_height,
-                    batch.draw.texture_buffer_width, batch.draw.clut_address,
-                    batch.draw.through ? 1 : 0, batch.textured ? 1 : 0,
+                    draw.framebuffer_address & 0x001FFFF0u, draw.texture_address,
+                    draw.texture_format, draw.texture_width, draw.texture_height,
+                    draw.texture_buffer_width, draw.clut_address,
+                    draw.through ? 1 : 0, batch.textured ? 1 : 0,
                     texture != s.textures.end() ? 1 : 0);
             }
             continue;
         }
-        const std::uint32_t pipeline_index = batch.draw.depth_test_enabled
-            ? 2u + (batch.draw.depth_function & 7u) * 4u +
-                (batch.draw.depth_write_enabled ? 2u : 0u) + (textured ? 1u : 0u)
+        const std::uint32_t pipeline_index = draw.depth_test_enabled
+            ? 2u + (draw.depth_function & 7u) * 4u +
+                (draw.depth_write_enabled ? 2u : 0u) + (textured ? 1u : 0u)
             : (textured ? 1u : 0u);
         const std::uint32_t blend = blend_variant(batch.draw);
         vkCmdBindPipeline(s.command, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           s.pipelines[pipeline_index + blend * 34u]);
         if (blend == 3u) {
-            const std::uint32_t fix = batch.draw.blend_fix_source;
+            const std::uint32_t fix = draw.blend_fix_source;
             const std::array<float, 4> constants{
                 static_cast<float>(fix & 0xFFu) / 255.0f,
                 static_cast<float>((fix >> 8u) & 0xFFu) / 255.0f,
                 static_cast<float>((fix >> 16u) & 0xFFu) / 255.0f, 1.0f};
             vkCmdSetBlendConstants(s.command, constants.data());
         }
-        if (batch.draw.depth_test_enabled) ++s.report.depth_tested_game_draw_calls;
-        if (batch.draw.depth_write_enabled) ++s.report.depth_writing_game_draw_calls;
+        if (draw.depth_test_enabled) ++s.report.depth_tested_game_draw_calls;
+        if (draw.depth_write_enabled) ++s.report.depth_writing_game_draw_calls;
         if (textured) {
             const VkDescriptorSet descriptor = batch.framebuffer_feedback
                 ? s.world_descriptor : texture->second.descriptor;
             vkCmdBindDescriptorSets(s.command, VK_PIPELINE_BIND_POINT_GRAPHICS,
                 s.pipeline_layout, 0u, 1u, &descriptor, 0u, nullptr);
             const std::array<std::uint32_t, 4> control{
-                batch.draw.texture_function, batch.draw.texture_use_alpha ? 1u : 0u,
-                batch.draw.texture_double_color ? 1u : 0u, 0u};
-            const std::uint32_t env = batch.draw.texture_env;
+                draw.texture_function, draw.texture_use_alpha ? 1u : 0u,
+                draw.texture_double_color ? 1u : 0u, 0u};
+            const std::uint32_t env = draw.texture_env;
             const std::array<float, 4> environment{
                 static_cast<float>(env & 0xFFu) / 255.0f,
                 static_cast<float>((env >> 8u) & 0xFFu) / 255.0f,
@@ -1607,10 +1624,10 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
             return static_cast<std::int32_t>(std::clamp<std::int64_t>(
                 static_cast<std::int64_t>(value) * physical_height / height, 0, physical_height));
         };
-        const std::int32_t x0 = sx(batch.draw.scissor_x0);
-        const std::int32_t y0 = sy(batch.draw.scissor_y0);
-        const std::int32_t x1 = sx(batch.draw.scissor_x1 + 1);
-        const std::int32_t y1 = sy(batch.draw.scissor_y1 + 1);
+        const std::int32_t x0 = sx(draw.scissor_x0);
+        const std::int32_t y0 = sy(draw.scissor_y0);
+        const std::int32_t x1 = sx(draw.scissor_x1 + 1);
+        const std::int32_t y1 = sy(draw.scissor_y1 + 1);
         if (x1 <= x0 || y1 <= y0) continue;
         VkRect2D scissor{{x0, y0},
                          {static_cast<std::uint32_t>(x1 - x0),
