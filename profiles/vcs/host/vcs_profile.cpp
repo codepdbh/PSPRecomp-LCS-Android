@@ -983,9 +983,14 @@ constexpr std::uint32_t kGuestFrameLimiterBranch = 0x08A070C8u;
 constexpr std::uint32_t kGuestFrameLimiterContinue = 0x08A070D0u;
 constexpr std::int32_t kGuestFrameCounterGpOffset = -8852;
 
+// LCS has the same wait loop ("while fewer than 2 vblanks since the last
+// frame, wait for one more"), found by searching for its sltiu ..,2 and
+// backwards branch; it reads the frame counter through $s3 instead of $gp.
+constexpr std::uint32_t kLcsFrameLimiterBranch = 0x08AB338Cu;
+constexpr std::uint32_t kLcsFrameLimiterContinue = 0x08AB3394u;
+constexpr std::uint32_t kLcsFrameCounterS3Offset = 10848u;
+
 std::uint32_t configured_game_frame_rate() noexcept {
-    // Anything above 30 needs the frame-limiter patch, which exists for VCS only.
-    if (kTitleLcs) return 30u;
     return vcs_configuration().timing.frame_rate;
 }
 
@@ -1008,6 +1013,14 @@ void unlocked_frame_limiter_patch(psprecomp::Runtime &runtime,
     ctx.set_gpr(4, runtime.memory().load32(
         ctx.gpr[28] + static_cast<std::uint32_t>(kGuestFrameCounterGpOffset)));
     ctx.pc = kGuestFrameLimiterContinue;
+}
+
+// The same NOP over LCS's loop-back branch: its delay-slot load of the frame
+// counter still happens, then the loop is left after a single vblank.
+void lcs_unlocked_frame_limiter_patch(psprecomp::Runtime &runtime,
+                                      psprecomp::AllegrexContext &ctx) {
+    ctx.set_gpr(4, runtime.memory().load32(ctx.gpr[19] + kLcsFrameCounterS3Offset));
+    ctx.pc = kLcsFrameLimiterContinue;
 }
 bool volatile_memory_locked{};
 std::uint32_t general_purpose_io{};
@@ -6328,10 +6341,15 @@ void register_lcs_system_extras(psprecomp::Runtime &runtime) {
 void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start) {
     // Native leaves and the frame-limiter patch sit at VCS addresses.
     if (!kTitleLcs) install_native_fast_paths(runtime);
-    if (!kTitleLcs && configured_game_frame_rate() > 30u) {
-        runtime.register_function(kGuestFrameLimiterBranch,
-                                  &unlocked_frame_limiter_patch,
-                                  "vcs_unlocked_frame_limiter");
+    if (configured_game_frame_rate() > 30u) {
+        if (kTitleLcs)
+            runtime.register_function(kLcsFrameLimiterBranch,
+                                      &lcs_unlocked_frame_limiter_patch,
+                                      "lcs_unlocked_frame_limiter");
+        else
+            runtime.register_function(kGuestFrameLimiterBranch,
+                                      &unlocked_frame_limiter_patch,
+                                      "vcs_unlocked_frame_limiter");
     }
     std::cerr << "[frame-rate] target=" << configured_game_frame_rate()
               << " virtual_display=" << virtual_display_refresh_hz() << " Hz\n";
