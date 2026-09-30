@@ -4511,6 +4511,15 @@ void limit_frame_rate() {
         // Capping keeps the clock honest without the leap.
         const auto behind = std::chrono::duration_cast<std::chrono::microseconds>(
             now - target).count();
+        // A small debt is carried, not forgiven: the anchor stays, so the next
+        // vblank starts at once and absorbs it. Games alternate heavy and light
+        // vblanks -- LCS draws its world on one and only composites on the next
+        // -- and re-anchoring after every heavy one made the light one wait a
+        // whole period anyway: 27 + 16.7 ms per game frame (~23 FPS) where the
+        // pair fits in 33 ms. Only a deficit beyond a vblank and a half is a
+        // real slowdown that moves the guest clock.
+        const auto carry = static_cast<std::int64_t>(virtual_vblank_period_us() * 3u / 2u);
+        if (behind <= carry) return;
         if (behind > 0) {
             // At a ~10 FPS Android software frame, four virtual periods cover
             // only ~67 ms of a ~100 ms wall frame. Audio is then produced more

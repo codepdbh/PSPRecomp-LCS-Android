@@ -54,6 +54,11 @@ android {
         lcs {
             dimension "game"
             applicationId "com.psprecomp.lcs"
+            // LCS has its own release line, starting over from 0.1. The code
+            // stays above the 4 its development builds carried, so it installs
+            // over them.
+            versionCode 5
+            versionName "0.1.0-beta"
             manifestPlaceholders = [appLabel: "LCS Android"]
             buildConfigField "String", "GAME_FOLDER", "\"LCS\""
             externalNativeBuild { cmake { arguments "-DPSPRECOMP_GUEST_TITLE=lcs" } }
