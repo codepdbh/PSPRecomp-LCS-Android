@@ -1,0 +1,30 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Grand Theft Auto: Liberty City Stories",
+  "system": "PSP",
+  "type": "recomp",
+  "project": "PSPRecomp Liberty City Stories Android",
+  "status": "released",
+  "targets": [
+    "Android"
+  ],
+  "approach": "Static Allegrex-to-C++ recompilation using PSPRecomp, sharing the VCS Android runtime and Vulkan renderer.",
+  "maintainers": [
+    {
+      "name": "codepdbh",
+      "link": "https://github.com/codepdbh"
+    }
+  ],
+  "notes": "Public ARM64 beta APKs. City rendering, audio, touch controls and shared runtime features are available. Loading-logo distortion and missing multiplayer remain. This repository extends the VCS profile for Liberty City Stories.",
+  "toolchain": "PSPRecomp",
+  "links": [
+    {
+      "label": "Upstream project",
+      "url": "https://github.com/jessicanataliagta/PSPRecomp"
+    }
+  ],
+  "original": {
+    "region": "USA",
+    "serial": "ULUS10041"
+  }
+}
